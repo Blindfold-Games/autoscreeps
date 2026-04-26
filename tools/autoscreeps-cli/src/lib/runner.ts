@@ -18,7 +18,8 @@ import type {
   VariantRecord,
   VariantRole
 } from "./contracts.ts";
-import { autoscreepsTelemetrySegmentId, buildTelemetryByRole } from "./bot-telemetry.ts";
+import { autoscreepsTelemetrySegmentId, buildTelemetryByRole, nexusTelemetrySegmentId } from "./bot-telemetry.ts";
+import { buildNexusTelemetryByRole } from "./nexus-telemetry.ts";
 import { copyFileToScreepsService, resetPrivateServer, restartScreepsService } from "./docker.ts";
 import { createWorkspaceSnapshot, parseVariantSource, resolveRepoRoot, withGitWorktree } from "./git.ts";
 import { appendEvent, appendIndexEntry, appendRunSample, createRunWorkspace, writeMetrics, writeRunRecord, writeVariantRecords } from "./history.ts";
@@ -266,6 +267,7 @@ export async function runDuelExperiment(input: DuelRunInput): Promise<RunDetails
       targetGameTime
     });
 
+    const isNexus = scenario.config.bot === "nexus";
     let lastReportedGameTime: number | null = null;
     let lastSampleGameTime: number | null = null;
 
@@ -297,6 +299,7 @@ export async function runDuelExperiment(input: DuelRunInput): Promise<RunDetails
         const captureSample = shouldCaptureRunSample(runRecord.run.startGameTime!, lastSampleGameTime, gameTime, sampleEveryTicks);
         let stats: StatsResponse | null = null;
         let telemetryData: Record<VariantRole, string | null> | null = null;
+        let nexusTelemetryData: Record<VariantRole, string | null> | null = null;
         let roomData: RunSample["rooms"] | null = null;
 
         if (runRecord.run.terminalConditions || captureSample) {
@@ -304,16 +307,22 @@ export async function runDuelExperiment(input: DuelRunInput): Promise<RunDetails
         }
 
         if (captureSample) {
+          const telemetrySegment = isNexus ? nexusTelemetrySegmentId : autoscreepsTelemetrySegmentId;
           const [baselineTelemetry, candidateTelemetry, baselineRoomObjects, candidateRoomObjects] = await Promise.all([
-            api.getMemorySegment(baselineSession, autoscreepsTelemetrySegmentId),
-            api.getMemorySegment(candidateSession, autoscreepsTelemetrySegmentId),
+            api.getMemorySegment(baselineSession, telemetrySegment),
+            api.getMemorySegment(candidateSession, telemetrySegment),
             api.getRoomObjects(runRecord.rooms.baseline),
             api.getRoomObjects(runRecord.rooms.candidate)
           ]);
-          telemetryData = {
+          const rawTelemetry = {
             baseline: baselineTelemetry,
             candidate: candidateTelemetry
           };
+          if (isNexus) {
+            nexusTelemetryData = rawTelemetry;
+          } else {
+            telemetryData = rawTelemetry;
+          }
           roomData = {
             baseline: buildSampleRoomMetrics(runRecord.rooms.baseline, baselineRoomObjects),
             candidate: buildSampleRoomMetrics(runRecord.rooms.candidate, candidateRoomObjects)
@@ -348,7 +357,7 @@ export async function runDuelExperiment(input: DuelRunInput): Promise<RunDetails
         }
 
         if (captureSample && stats) {
-          const sample = buildRunSample(gameTime, stats, credentials, telemetryData, roomData);
+          const sample = buildRunSample(gameTime, stats, credentials, telemetryData, nexusTelemetryData, roomData);
           samples.push(sample);
           lastSampleGameTime = gameTime;
           await appendRunSample(runDir, sample);
@@ -405,16 +414,18 @@ export async function runDuelExperiment(input: DuelRunInput): Promise<RunDetails
     ]);
 
     if (samples[samples.length - 1]?.gameTime !== endGameTime) {
+      const finalTelemetrySegment = isNexus ? nexusTelemetrySegmentId : autoscreepsTelemetrySegmentId;
       const [baselineTelemetry, candidateTelemetry, baselineRoomObjects, candidateRoomObjects] = await Promise.all([
-        api.getMemorySegment(baselineSession, autoscreepsTelemetrySegmentId),
-        api.getMemorySegment(candidateSession, autoscreepsTelemetrySegmentId),
+        api.getMemorySegment(baselineSession, finalTelemetrySegment),
+        api.getMemorySegment(candidateSession, finalTelemetrySegment),
         api.getRoomObjects(runRecord.rooms.baseline),
         api.getRoomObjects(runRecord.rooms.candidate)
       ]);
-      const finalSample = buildRunSample(endGameTime, finalStats, credentials, {
-        baseline: baselineTelemetry,
-        candidate: candidateTelemetry
-      }, {
+      const finalRaw = { baseline: baselineTelemetry, candidate: candidateTelemetry };
+      const finalSample = buildRunSample(endGameTime, finalStats, credentials,
+        isNexus ? null : finalRaw,
+        isNexus ? finalRaw : null,
+        {
         baseline: buildSampleRoomMetrics(runRecord.rooms.baseline, baselineRoomObjects),
         candidate: buildSampleRoomMetrics(runRecord.rooms.candidate, candidateRoomObjects)
       });
@@ -670,6 +681,7 @@ function buildRunSample(
   stats: StatsResponse,
   credentials: Record<VariantRole, { username: string }>,
   telemetryData: Record<VariantRole, string | null> | null,
+  nexusTelemetryData: Record<VariantRole, string | null> | null,
   roomData: Record<VariantRole, RunSampleRoomMetrics> | null
 ): RunSample {
   const sample: RunSample = {
@@ -686,6 +698,10 @@ function buildRunSample(
 
   if (telemetryData) {
     sample.telemetry = buildTelemetryByRole(telemetryData);
+  }
+
+  if (nexusTelemetryData) {
+    sample.nexusTelemetry = buildNexusTelemetryByRole(nexusTelemetryData);
   }
 
   return sample;

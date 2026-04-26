@@ -1,0 +1,19 @@
+version: 1
+name: nexus-logistics
+description: Nexus logistics stress test - reduced source yield forces grid efficiency. Terminal at RCL4.
+bot: nexus
+reset: full
+mapGenerator:
+  type: mirrored-random-1x1
+run:
+  maxTicks: 10000
+  tickDuration: 250
+  pollIntervalMs: 1000
+  maxWallClockMs: 1200000
+  maxStalledPolls: 30
+  terminalConditions:
+    win:
+      - type: any-owned-controller-level-at-least
+        level: 4
+    fail:
+      - type: no-owned-controllers

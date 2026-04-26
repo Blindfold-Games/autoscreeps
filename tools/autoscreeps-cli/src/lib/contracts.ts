@@ -60,7 +60,13 @@ export type SuitePrimaryMetric =
   | "controllerProgressToRCL3Pct"
   | "spawnWaitingForSufficientEnergyPct"
   | "sourceCoveragePct"
-  | "sourceUptimePct";
+  | "sourceUptimePct"
+  | "nexusSpawnEfficiencyPct"
+  | "nexusSourceCoveragePct"
+  | "nexusCortexSkipRatePct"
+  | "nexusLogisticsEfficiencyPct"
+  | "nexusProtocolChurnRatePct"
+  | "nexusRoadCoverage";
 
 export type SuiteGates = {
   primaryMetrics: SuitePrimaryMetric[];
@@ -196,6 +202,58 @@ export type BotTelemetrySnapshot = {
   counters?: Record<string, number>;
 };
 
+export type NexusTelemetrySnapshot = {
+  schemaVersion: number;
+  tick: number;
+  colony: {
+    rcl: number;
+    controllerProgress: number;
+    controllerProgressTotal: number;
+    totalCreeps: number;
+    creepsByProtocol: Record<string, number>;
+  };
+  cortex: {
+    protocolsScheduled: number;
+    protocolsSkipped: number;
+    beaconQueueDepth: number;
+    priorityDistribution: Record<string, number>;
+  };
+  spawn: {
+    queueDepth: number;
+    spawning: boolean;
+    spawnEvents: number;
+    idleSpawnTicks: number;
+    lastBlueprintUsed: string | null;
+  };
+  protocols: Array<{
+    type: string;
+    id: string;
+    creepCount: number;
+    routineCompletions: number;
+    routineFailures: number;
+    ticksActive: number;
+    created: boolean;
+    destroyed: boolean;
+  }>;
+  logistics: {
+    activeConduits: number;
+    totalEnergyRouted: number;
+    dropsCreated: number;
+    dropToPickupLatencyAvg: number;
+    gridNodeUtilization: number;
+  };
+  blueprints: Array<{
+    name: string;
+    timesSpawned: number;
+  }>;
+  architect: {
+    structuresPlaced: number;
+    roadCoverage: number;
+    lastPlacementTick: number;
+    tierCompletionTicks: Record<string, number>;
+  };
+};
+
 export type RunRecord = {
   id: string;
   type: "duel";
@@ -292,6 +350,7 @@ export type RunSample = {
   users: Record<VariantRole, UserSampleMetrics>;
   rooms?: Record<VariantRole, RunSampleRoomMetrics>;
   telemetry?: Record<VariantRole, BotTelemetrySnapshot | null>;
+  nexusTelemetry?: Record<VariantRole, NexusTelemetrySnapshot | null>;
 };
 
 export type UserRunSummaryMetrics = {
@@ -311,6 +370,13 @@ export type UserRunSummaryMetrics = {
   harvestingSourceUptimePct: number | null;
   activeHarvestingSourceCoveragePct: number | null;
   activeHarvestingSourceUptimePct: number | null;
+  nexusTelemetrySampleCount: number;
+  nexusSpawnEfficiencyPct: number | null;
+  nexusSourceCoveragePct: number | null;
+  nexusCortexSkipRatePct: number | null;
+  nexusLogisticsEfficiencyPct: number | null;
+  nexusProtocolChurnRatePct: number | null;
+  nexusRoadCoverage: number | null;
 };
 
 export type RunSummaryMetrics = {

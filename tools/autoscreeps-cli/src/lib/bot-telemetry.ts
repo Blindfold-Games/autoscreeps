@@ -1,6 +1,7 @@
 import type { BotTelemetrySnapshot, VariantRole } from "./contracts.ts";
 
 export const autoscreepsTelemetrySegmentId = 42;
+export const nexusTelemetrySegmentId = 43;
 
 export function parseBotTelemetry(value: string | null): BotTelemetrySnapshot | null {
   if (!value) {

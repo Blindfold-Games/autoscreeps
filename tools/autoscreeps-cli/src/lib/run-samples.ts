@@ -47,6 +47,22 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
   let allRcl2ExtensionsTick: number | null = null;
   let telemetrySampleCount = 0;
   let spawnIdleSamples = 0;
+  let nexusTelemetrySampleCount = 0;
+  let nexusSpawnEventSamples = 0;
+  let nexusTotalSpawnEvents = 0;
+  let nexusTotalIdleSpawnTicks = 0;
+  let nexusSourceCoverageSamples = 0;
+  let nexusTotalSourceCoverage = 0;
+  let nexusCortexSkipSamples = 0;
+  let nexusTotalScheduled = 0;
+  let nexusTotalSkipped = 0;
+  let nexusLogisticsSamples = 0;
+  let nexusTotalEnergyRouted = 0;
+  let nexusTotalDropsCreated = 0;
+  let nexusChurnSamples = 0;
+  let nexusTotalChurnRate = 0;
+  let nexusRoadCoverageSamples = 0;
+  let nexusTotalRoadCoverage = 0;
   let sourceCoverageSamples = 0;
   let totalSourceCoverage = 0;
   let fullyStaffedSamples = 0;
@@ -122,6 +138,54 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
         }
       }
     }
+
+    const nexusTelemetry = sample.nexusTelemetry?.[role];
+    if (nexusTelemetry) {
+      nexusTelemetrySampleCount++;
+
+      const spawnEvents = nexusTelemetry.spawn.spawnEvents;
+      const idleSpawnTicks = nexusTelemetry.spawn.idleSpawnTicks;
+      if (spawnEvents + idleSpawnTicks > 0) {
+        nexusSpawnEventSamples++;
+        nexusTotalSpawnEvents += spawnEvents;
+        nexusTotalIdleSpawnTicks += idleSpawnTicks;
+      }
+
+      const mineProtocols = nexusTelemetry.protocols.filter((p) =>
+        p.type.toLowerCase().includes("mine") || p.type.toLowerCase().includes("extract")
+      );
+      if (mineProtocols.length > 0) {
+        nexusSourceCoverageSamples++;
+        nexusTotalSourceCoverage += mineProtocols.filter((p) => p.creepCount > 0).length / Math.max(mineProtocols.length, 1);
+      }
+
+      const scheduled = nexusTelemetry.cortex.protocolsScheduled;
+      const skipped = nexusTelemetry.cortex.protocolsSkipped;
+      if (scheduled + skipped > 0) {
+        nexusCortexSkipSamples++;
+        nexusTotalScheduled += scheduled;
+        nexusTotalSkipped += skipped;
+      }
+
+      const dropsCreated = nexusTelemetry.logistics.dropsCreated;
+      if (dropsCreated > 0) {
+        nexusLogisticsSamples++;
+        nexusTotalEnergyRouted += nexusTelemetry.logistics.totalEnergyRouted;
+        nexusTotalDropsCreated += dropsCreated;
+      }
+
+      const activeProtocols = nexusTelemetry.protocols.length;
+      if (activeProtocols > 0) {
+        const churnCount = nexusTelemetry.protocols.filter((p) => p.created || p.destroyed).length;
+        nexusChurnSamples++;
+        nexusTotalChurnRate += churnCount / activeProtocols;
+      }
+
+      if (nexusTelemetry.architect.roadCoverage > 0) {
+        nexusRoadCoverageSamples++;
+        nexusTotalRoadCoverage += nexusTelemetry.architect.roadCoverage;
+      }
+    }
   }
 
   return {
@@ -140,7 +204,26 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
     harvestingSourceCoveragePct: toPercent(totalHarvestingSourceCoverage, harvestingSourceCoverageSamples),
     harvestingSourceUptimePct: toPercent(fullyHarvestingStaffedSamples, harvestingSourceCoverageSamples),
     activeHarvestingSourceCoveragePct: toPercent(totalActiveHarvestingSourceCoverage, activeHarvestingSourceCoverageSamples),
-    activeHarvestingSourceUptimePct: toPercent(fullyActiveHarvestingStaffedSamples, activeHarvestingSourceCoverageSamples)
+    activeHarvestingSourceUptimePct: toPercent(fullyActiveHarvestingStaffedSamples, activeHarvestingSourceCoverageSamples),
+    nexusTelemetrySampleCount,
+    nexusSpawnEfficiencyPct: nexusSpawnEventSamples > 0
+      ? toPercent(nexusTotalSpawnEvents, nexusTotalSpawnEvents + nexusTotalIdleSpawnTicks)
+      : null,
+    nexusSourceCoveragePct: nexusSourceCoverageSamples > 0
+      ? toPercent(nexusTotalSourceCoverage, nexusSourceCoverageSamples)
+      : null,
+    nexusCortexSkipRatePct: nexusCortexSkipSamples > 0
+      ? toPercent(nexusTotalSkipped, nexusTotalScheduled + nexusTotalSkipped)
+      : null,
+    nexusLogisticsEfficiencyPct: nexusLogisticsSamples > 0
+      ? toPercent(nexusTotalEnergyRouted, nexusTotalDropsCreated * 300)
+      : null,
+    nexusProtocolChurnRatePct: nexusChurnSamples > 0
+      ? toPercent(nexusTotalChurnRate, nexusChurnSamples)
+      : null,
+    nexusRoadCoverage: nexusRoadCoverageSamples > 0
+      ? Math.round((nexusTotalRoadCoverage / nexusRoadCoverageSamples) * 10000) / 100
+      : null
   };
 }
 

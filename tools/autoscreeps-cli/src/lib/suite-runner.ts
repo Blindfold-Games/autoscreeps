@@ -493,6 +493,18 @@ function metricValue(summary: UserRunSummaryMetrics, metric: SuiteSummaryMetric)
       return summary.firstExtensionTick;
     case "allRcl2ExtensionsTick":
       return summary.allRcl2ExtensionsTick;
+    case "nexusSpawnEfficiencyPct":
+      return summary.nexusSpawnEfficiencyPct;
+    case "nexusSourceCoveragePct":
+      return summary.nexusSourceCoveragePct;
+    case "nexusCortexSkipRatePct":
+      return summary.nexusCortexSkipRatePct;
+    case "nexusLogisticsEfficiencyPct":
+      return summary.nexusLogisticsEfficiencyPct;
+    case "nexusProtocolChurnRatePct":
+      return summary.nexusProtocolChurnRatePct;
+    case "nexusRoadCoverage":
+      return summary.nexusRoadCoverage;
   }
 }
 
@@ -511,7 +523,14 @@ function metricDirection(metric: SuiteSummaryMetric): SuiteMetricComparison["dir
     case "harvestingSourceUptimePct":
     case "activeHarvestingSourceCoveragePct":
     case "activeHarvestingSourceUptimePct":
+    case "nexusSpawnEfficiencyPct":
+    case "nexusSourceCoveragePct":
+    case "nexusLogisticsEfficiencyPct":
+    case "nexusRoadCoverage":
       return "higher-is-better";
+    case "nexusCortexSkipRatePct":
+    case "nexusProtocolChurnRatePct":
+      return "lower-is-better";
   }
 }
 

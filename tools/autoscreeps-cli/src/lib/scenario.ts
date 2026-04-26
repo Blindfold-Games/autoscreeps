@@ -53,6 +53,7 @@ export const scenarioSchema = z.object({
   version: z.literal(1),
   name: z.string().min(1),
   description: z.string().optional(),
+  bot: z.enum(["basic", "nexus"]).default("basic"),
   reset: z.enum(["full"]).default("full"),
   map: z.string().min(1).optional(),
   mapGenerator: mapGeneratorSchema.optional(),

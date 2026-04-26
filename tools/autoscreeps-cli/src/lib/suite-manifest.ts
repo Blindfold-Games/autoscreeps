@@ -25,7 +25,13 @@ export const suitePrimaryMetricSchema = z.enum([
   "controllerProgressToRCL3Pct",
   "spawnWaitingForSufficientEnergyPct",
   "sourceCoveragePct",
-  "sourceUptimePct"
+  "sourceUptimePct",
+  "nexusSpawnEfficiencyPct",
+  "nexusSourceCoveragePct",
+  "nexusCortexSkipRatePct",
+  "nexusLogisticsEfficiencyPct",
+  "nexusProtocolChurnRatePct",
+  "nexusRoadCoverage"
 ]);
 
 const mapGeneratorOverrideSchema = z.object({

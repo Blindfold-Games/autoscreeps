@@ -1,0 +1,19 @@
+version: 1
+name: nexus-opener
+description: Nexus head-to-head on mirrored 1x1 sector, measuring opener speed to RCL3.
+bot: nexus
+reset: full
+mapGenerator:
+  type: mirrored-random-1x1
+run:
+  maxTicks: 5000
+  tickDuration: 250
+  pollIntervalMs: 1000
+  maxWallClockMs: 600000
+  maxStalledPolls: 30
+  terminalConditions:
+    win:
+      - type: any-owned-controller-level-at-least
+        level: 3
+    fail:
+      - type: no-owned-controllers
