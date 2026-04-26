@@ -9,140 +9,60 @@ describe("spawn manager", () => {
 
     testGlobal.Memory = {
       creeps: {}
-    } as unknown as Memory;
+    } as Memory;
 
     testGlobal.Game = {
       creeps: {},
       spawns: {},
+      rooms: {},
       time: 123
     } as unknown as Game;
   });
 
-  it("picks the best body it can afford", () => {
-    expect(chooseBody("harvester", 150)).toBeNull();
-    expect(chooseBody("worker", 300)).toEqual([WORK, CARRY, CARRY, MOVE, MOVE]);
-    expect(chooseBody("courier", 700)).toEqual([CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, CARRY, MOVE, MOVE, MOVE, MOVE]);
+  it("builds repeated tutorial worker bodies", () => {
+    expect(chooseBody("worker", 150)).toBeNull();
+    expect(chooseBody("worker", 300)).toEqual([WORK, CARRY, MOVE]);
+    expect(chooseBody("worker", 600)).toEqual([WORK, CARRY, MOVE, WORK, CARRY, MOVE, WORK, CARRY, MOVE]);
   });
 
-  it("spawns a harvester first", () => {
-    const spawn = makeSpawn();
+  it("spawns workers until the target count is met", () => {
+    const request = createSpawnRequest(makeSpawn());
 
-    const request = createSpawnRequest(spawn);
-
-    expect(request?.memory.role).toBe("harvester");
-    expect(request?.name).toBe("harvester-123");
-  });
-
-  it("spawns a courier after the first harvester", () => {
-    const testGlobal = globalThis as typeof globalThis & { Game: Game };
-
-    testGlobal.Game.creeps = {
-      harvesterA: makeCreep("harvester", 2)
-    };
-
-    const spawn = makeSpawn();
-    const request = createSpawnRequest(spawn);
-
-    expect(request?.memory.role).toBe("harvester");
-  });
-
-  it("spawns a worker once dedicated harvester throughput is covered", () => {
-    const testGlobal = globalThis as typeof globalThis & { Game: Game };
-
-    testGlobal.Game.creeps = {
-      harvesterA: makeCreep("harvester", 2),
-      harvesterB: makeCreep("harvester", 2)
-    };
-
-    const spawn = makeSpawn();
-    const request = createSpawnRequest(spawn);
-
-    expect(request?.memory.role).toBe("worker");
-  });
-
-  it("summarizes unmet demand across dynamic roles", () => {
-    const testGlobal = globalThis as typeof globalThis & { Game: Game };
-
-    testGlobal.Game.creeps = {
-      harvesterA: makeCreep("harvester", 2),
-      harvesterB: makeCreep("harvester", 2),
-      workerA: makeCreep("worker", 1)
-    };
-
-    expect(summarizeSpawnDemand(makeSpawn().room)).toEqual({
-      unmetDemand: {
-        harvester: 0,
-        courier: 0,
-        worker: 5
-      },
-      nextRole: "worker",
-      totalUnmetDemand: 5
+    expect(request).toMatchObject({
+      name: "worker-123",
+      memory: {
+        role: "worker",
+        working: false,
+        homeRoom: "W0N0"
+      }
     });
   });
 
-  it("keeps one extra affordable worker queued once harvest coverage is met", () => {
+  it("reports no demand once five workers exist", () => {
     const testGlobal = globalThis as typeof globalThis & { Game: Game };
-
-    testGlobal.Game.creeps = {
-      harvesterA: makeCreep("harvester", 2),
-      harvesterB: makeCreep("harvester", 2),
-      workerA: makeCreep("worker", 1),
-      workerB: makeCreep("worker", 1),
-      workerC: makeCreep("worker", 1),
-      workerD: makeCreep("worker", 1),
-      workerE: makeCreep("worker", 1),
-      workerF: makeCreep("worker", 1)
-    };
+    testGlobal.Game.creeps = Object.fromEntries(
+      Array.from({ length: 5 }, (_, index) => [`worker-${index}`, makeWorkerCreep("W0N0")])
+    ) as Record<string, Creep>;
 
     expect(summarizeSpawnDemand(makeSpawn().room)).toEqual({
-      unmetDemand: {
-        harvester: 0,
-        courier: 0,
-        worker: 1
-      },
-      nextRole: "worker",
-      totalUnmetDemand: 1
+      unmetDemand: { worker: 0 },
+      nextRole: null,
+      totalUnmetDemand: 0
     });
   });
 
-  it("caps pre-RCL3 worker bodies to smaller cadence packets", () => {
-    const testGlobal = globalThis as typeof globalThis & { Game: Game };
-
-    testGlobal.Game.creeps = {
-      harvesterA: makeCreep("harvester", 2),
-      harvesterB: makeCreep("harvester", 2)
-    };
-
-    const request = createSpawnRequest(makeSpawn({ energyAvailable: 550, energyCapacityAvailable: 550, controllerLevel: 2 }));
-
-    expect(request?.memory.role).toBe("worker");
-    expect(request?.body).toEqual([WORK, CARRY, CARRY, MOVE, MOVE]);
-  });
-
-  it("caps pre-RCL3 harvester bodies to smaller cadence packets", () => {
-    const request = createSpawnRequest(makeSpawn({ energyAvailable: 550, energyCapacityAvailable: 550, controllerLevel: 2 }));
-
-    expect(request?.memory.role).toBe("harvester");
-    expect(request?.body).toEqual([WORK, WORK, CARRY, MOVE]);
-  });
-
-  it("waits for the full pre-RCL3 cadence packet before spawning", () => {
-    const request = createSpawnRequest(makeSpawn({ energyAvailable: 250, energyCapacityAvailable: 550, controllerLevel: 2 }));
-
-    expect(request).toBeNull();
-  });
-
-  it("passes the planned body and memory into spawnCreep", () => {
+  it("delegates to spawnCreep when a worker should be spawned", () => {
     const spawn = makeSpawn();
 
-    runSpawnManager(spawn);
+    const result = runSpawnManager(spawn);
 
+    expect(result).toBe(OK);
     expect(spawn.spawnCreep).toHaveBeenCalledWith(
-      [WORK, WORK, CARRY, MOVE],
-      "harvester-123",
+      [WORK, CARRY, MOVE],
+      "worker-123",
       {
         memory: {
-          role: "harvester",
+          role: "worker",
           working: false,
           homeRoom: "W0N0"
         }
@@ -151,47 +71,29 @@ describe("spawn manager", () => {
   });
 });
 
-function makeSpawn(input: {
-  energyAvailable?: number;
-  energyCapacityAvailable?: number;
-  controllerLevel?: number;
-} = {}): StructureSpawn {
+function makeSpawn(): StructureSpawn {
   return {
     name: "Spawn1",
     spawning: null,
     room: {
       name: "W0N0",
-      energyAvailable: input.energyAvailable ?? 300,
-      energyCapacityAvailable: input.energyCapacityAvailable ?? 300,
+      energyAvailable: 300,
+      energyCapacityAvailable: 300,
       controller: {
         my: true,
-        level: input.controllerLevel ?? 1
-      },
-      find: vi.fn((type: number, opts?: { filter?: (value: unknown) => boolean }) => {
-        if (type === FIND_SOURCES) {
-          return [
-            { id: "source-a", pos: { x: 10, y: 10, roomName: "W0N0" } },
-            { id: "source-b", pos: { x: 20, y: 20, roomName: "W0N0" } }
-          ] as Source[];
-        }
-        if (type === FIND_MY_CONSTRUCTION_SITES || type === FIND_DROPPED_RESOURCES) {
-          const values: unknown[] = [];
-          return opts?.filter ? values.filter(opts.filter) : values;
-        }
-
-        return [];
-      })
-    },
+        level: 1
+      }
+    } as Room,
     spawnCreep: vi.fn(() => OK)
   } as unknown as StructureSpawn;
 }
 
-function makeCreep(role: WorkerRole, workParts: number): Creep {
+function makeWorkerCreep(homeRoom: string): Creep {
   return {
     memory: {
-      role,
-      homeRoom: "W0N0"
-    },
-    body: Array.from({ length: workParts }, () => ({ type: WORK, hits: 100 }))
-  } as unknown as Creep;
+      role: "worker",
+      working: false,
+      homeRoom
+    }
+  } as Creep;
 }

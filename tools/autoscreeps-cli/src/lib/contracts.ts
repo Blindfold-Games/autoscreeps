@@ -1,6 +1,7 @@
 import type { TerminalCondition, TerminalConditionSet } from "./scenario.ts";
 
 export type VariantRole = "baseline" | "candidate";
+export type RoleRecord<T> = Partial<Record<VariantRole, T>>;
 
 export type GitVariantSnapshot = {
   kind: "git";
@@ -40,7 +41,21 @@ export type VariantInput = {
   packagePath: string;
 };
 
+export type RunType = "single" | "duel";
 export type RunStatus = "running" | "completed" | "failed";
+export type RunFailureKind = "report" | "bot" | "scenario" | "execution";
+
+export type BotReportHealth = {
+  status: "ok" | "missing" | "parse_error";
+  message: string | null;
+};
+
+export type BotReport = {
+  schemaVersion: number;
+  gameTime: number;
+  errors: string[];
+  telemetry?: unknown;
+};
 
 export type SuiteCaseStatus = "pending" | RunStatus;
 
@@ -54,30 +69,6 @@ export type SuiteSource =
     path: string;
   };
 
-export type SuitePrimaryMetric =
-  | "T_RCL2"
-  | "T_RCL3"
-  | "controllerProgressToRCL3Pct"
-  | "spawnWaitingForSufficientEnergyPct"
-  | "sourceCoveragePct"
-  | "sourceUptimePct"
-  | "nexusSpawnEfficiencyPct"
-  | "nexusSourceCoveragePct"
-  | "nexusCortexSkipRatePct"
-  | "nexusLogisticsEfficiencyPct"
-  | "nexusProtocolChurnRatePct"
-  | "nexusRoadCoverage";
-
-export type SuiteGates = {
-  primaryMetrics: SuitePrimaryMetric[];
-  training: {
-    minImprovedPrimaryMetrics: number;
-  };
-  holdout: {
-    maxRegressionPct: number;
-  };
-};
-
 export type SuiteCaseRecord = {
   id: string;
   cohort: "train" | "holdout";
@@ -87,6 +78,7 @@ export type SuiteCaseRecord = {
   scenarioName: string | null;
   runId: string | null;
   status: SuiteCaseStatus;
+  failureKind?: RunFailureKind | null;
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
@@ -102,10 +94,10 @@ export type SuiteRecord = {
   repoRoot: string;
   name: string;
   description?: string;
+  mode: RunType;
   source: SuiteSource;
   baseline: VariantInput;
-  candidate: VariantInput;
-  gates: SuiteGates;
+  candidate?: VariantInput;
   progress: {
     caseCount: number;
     completedCaseCount: number;
@@ -126,138 +118,22 @@ export type SuiteIndexEntry = {
   progress: SuiteRecord["progress"];
 };
 
-export type RunTerminationReason = "all-bots-terminal" | "max-ticks";
-
-export type TerminalOutcomeStatus = "won" | "failed" | "timed_out";
+export type RunTerminationReason = "all-bots-terminal" | "participant-failed" | "max-ticks";
+export type TerminalOutcomeStatus = "passed" | "failed";
+export type TerminalOutcomeReason = "win" | "fail" | "timeout";
 
 export type TerminalOutcome = {
   status: TerminalOutcomeStatus;
+  reason: TerminalOutcomeReason;
   gameTime: number;
   condition: TerminalCondition | null;
 };
 
-export type BotTelemetrySnapshot = {
-  schemaVersion: number;
-  gameTime: number;
-  debugError?: string | null;
-  colonyMode?: string;
-  totalCreeps?: number;
-  roleCounts?: Record<string, number>;
-  spawn?: {
-    queueDepth: number;
-    isSpawning: boolean;
-    nextRole: string | null;
-    unmetDemand: Record<string, number>;
-  };
-  sources?: {
-    total: number;
-    staffed: number;
-    assignments: Record<string, number>;
-    harvestingStaffed: number;
-    harvestingAssignments: Record<string, number>;
-    activeHarvestingStaffed?: number;
-    activeHarvestingAssignments?: Record<string, number>;
-    adjacentHarvesters?: Record<string, number>;
-    successfulHarvestTicks?: Record<string, number>;
-    dropEnergy?: Record<string, number>;
-    oldestDropAge?: Record<string, number>;
-    overAssigned?: Record<string, number>;
-    backlogEnergy?: number;
-  };
-  loop?: {
-    phaseTicks?: Record<string, number>;
-    actionAttempts?: Record<string, number>;
-    actionSuccesses?: Record<string, number>;
-    actionFailures?: Record<string, number>;
-    targetFailures?: Record<string, number>;
-    workingStateFlips?: Record<string, number>;
-    cargoUtilizationTicks?: Record<string, number>;
-    noTargetTicks?: Record<string, number>;
-    withEnergyNoSpendTicks?: Record<string, number>;
-    noEnergyAvailableTicks?: Record<string, number>;
-    sourceAssignmentTicks?: Record<string, number>;
-    sourceAdjacencyTicks?: Record<string, number>;
-    samePositionTicks?: Record<string, number>;
-    energyGained?: Record<string, number>;
-    energySpent?: Record<string, number>;
-    energySpentOnBuild?: number;
-    energySpentOnUpgrade?: number;
-    deliveredEnergyByTargetType?: Record<string, number>;
-    transferSuccessByTargetType?: Record<string, number>;
-    workerTaskSelections?: Record<string, number>;
-    sourceDropPickupLatencyTotal?: number;
-    sourceDropPickupLatencySamples?: number;
-    pickupToSpendLatencyTotal?: number;
-    pickupToSpendLatencySamples?: number;
-  };
-  creeps?: Record<string, {
-    role: string;
-    ticksSinceSuccess: number | null;
-    lastSuccessfulAction: string | null;
-    samePositionTicks: number;
-    targetSwitches: number;
-    lastTarget: string | null;
-  }>;
-  milestones?: Record<string, number | null>;
-  counters?: Record<string, number>;
-};
-
-export type NexusTelemetrySnapshot = {
-  schemaVersion: number;
-  tick: number;
-  colony: {
-    rcl: number;
-    controllerProgress: number;
-    controllerProgressTotal: number;
-    totalCreeps: number;
-    creepsByProtocol: Record<string, number>;
-  };
-  cortex: {
-    protocolsScheduled: number;
-    protocolsSkipped: number;
-    beaconQueueDepth: number;
-    priorityDistribution: Record<string, number>;
-  };
-  spawn: {
-    queueDepth: number;
-    spawning: boolean;
-    spawnEvents: number;
-    idleSpawnTicks: number;
-    lastBlueprintUsed: string | null;
-  };
-  protocols: Array<{
-    type: string;
-    id: string;
-    creepCount: number;
-    routineCompletions: number;
-    routineFailures: number;
-    ticksActive: number;
-    created: boolean;
-    destroyed: boolean;
-  }>;
-  logistics: {
-    activeConduits: number;
-    totalEnergyRouted: number;
-    dropsCreated: number;
-    dropToPickupLatencyAvg: number;
-    gridNodeUtilization: number;
-  };
-  blueprints: Array<{
-    name: string;
-    timesSpawned: number;
-  }>;
-  architect: {
-    structuresPlaced: number;
-    roadCoverage: number;
-    lastPlacementTick: number;
-    tierCompletionTicks: Record<string, number>;
-  };
-};
-
 export type RunRecord = {
   id: string;
-  type: "duel";
+  type: RunType;
   status: RunStatus;
+  failureKind?: RunFailureKind | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -272,10 +148,7 @@ export type RunRecord = {
     caseIndex: number;
     caseCount: number;
   };
-  rooms: {
-    baseline: string;
-    candidate: string;
-  };
+  rooms: RoleRecord<string>;
   run: {
     tickDuration: number;
     maxTicks: number;
@@ -345,12 +218,64 @@ export type RunSampleRoomMetrics = {
   extensions: number | null;
 };
 
+export type NexusTelemetrySnapshot = {
+  schemaVersion: number;
+  tick: number;
+  colony: {
+    rcl: number;
+    controllerProgress: number;
+    controllerProgressTotal: number;
+    totalCreeps: number;
+    creepsByProtocol: Record<string, number>;
+  };
+  cortex: {
+    protocolsScheduled: number;
+    protocolsSkipped: number;
+    beaconQueueDepth: number;
+    priorityDistribution: Record<string, number>;
+  };
+  spawn: {
+    queueDepth: number;
+    spawning: boolean;
+    spawnEvents: number;
+    idleSpawnTicks: number;
+    lastBlueprintUsed: string | null;
+  };
+  protocols: Array<{
+    type: string;
+    id: string;
+    creepCount: number;
+    routineCompletions: number;
+    routineFailures: number;
+    ticksActive: number;
+    created: boolean;
+    destroyed: boolean;
+  }>;
+  logistics: {
+    activeConduits: number;
+    totalEnergyRouted: number;
+    dropsCreated: number;
+    dropToPickupLatencyAvg: number;
+    gridNodeUtilization: number;
+  };
+  blueprints: Array<{
+    name: string;
+    timesSpawned: number;
+  }>;
+  architect: {
+    structuresPlaced: number;
+    roadCoverage: number;
+    lastPlacementTick: number;
+    tierCompletionTicks: Record<string, number>;
+  };
+};
+
 export type RunSample = {
   gameTime: number;
-  users: Record<VariantRole, UserSampleMetrics>;
-  rooms?: Record<VariantRole, RunSampleRoomMetrics>;
-  telemetry?: Record<VariantRole, BotTelemetrySnapshot | null>;
-  nexusTelemetry?: Record<VariantRole, NexusTelemetrySnapshot | null>;
+  users: RoleRecord<UserSampleMetrics>;
+  rooms?: RoleRecord<RunSampleRoomMetrics>;
+  reports?: RoleRecord<BotReport | null>;
+  nexusTelemetry?: RoleRecord<NexusTelemetrySnapshot | null>;
 };
 
 export type UserRunSummaryMetrics = {
@@ -362,14 +287,6 @@ export type UserRunSummaryMetrics = {
   maxOwnedControllers: number;
   firstExtensionTick: number | null;
   allRcl2ExtensionsTick: number | null;
-  telemetrySampleCount: number;
-  spawnWaitingForSufficientEnergyPct: number | null;
-  sourceCoveragePct: number | null;
-  sourceUptimePct: number | null;
-  harvestingSourceCoveragePct: number | null;
-  harvestingSourceUptimePct: number | null;
-  activeHarvestingSourceCoveragePct: number | null;
-  activeHarvestingSourceUptimePct: number | null;
   nexusTelemetrySampleCount: number;
   nexusSpawnEfficiencyPct: number | null;
   nexusSourceCoveragePct: number | null;
@@ -381,31 +298,28 @@ export type UserRunSummaryMetrics = {
 
 export type RunSummaryMetrics = {
   sampleEveryTicks: number;
-  users: Record<VariantRole, UserRunSummaryMetrics>;
+  users: RoleRecord<UserRunSummaryMetrics>;
 };
 
 export type RunMetrics = {
-  users: Record<VariantRole, UserRunMetrics>;
-  rooms: Record<VariantRole, RoomSummary>;
+  users: RoleRecord<UserRunMetrics>;
+  rooms: RoleRecord<RoomSummary>;
   summary?: RunSummaryMetrics;
 };
 
 export type RunIndexEntry = {
   id: string;
-  type: "duel";
+  type: RunType;
   status: RunStatus;
   createdAt: string;
   finishedAt: string | null;
   scenarioName: string;
-  rooms: {
-    baseline: string;
-    candidate: string;
-  };
+  rooms: RoleRecord<string>;
 };
 
 export type RunDetails = {
   run: RunRecord;
-  variants: Record<VariantRole, VariantRecord> | null;
+  variants: RoleRecord<VariantRecord> | null;
   metrics: RunMetrics | null;
   samples?: RunSample[] | null;
 };

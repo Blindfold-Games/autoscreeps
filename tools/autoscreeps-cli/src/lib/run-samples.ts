@@ -1,9 +1,8 @@
-import type { RunSample, RunSampleRoomMetrics, RunSummaryMetrics, UserRunSummaryMetrics, UserSampleMetrics, VariantRole } from "./contracts.ts";
+import type { RoleRecord, RunSample, RunSampleRoomMetrics, RunSummaryMetrics, UserRunSummaryMetrics, UserSampleMetrics, VariantRole } from "./contracts.ts";
 
 const trackedControllerLevels = [1, 2, 3, 4, 5, 6, 7, 8] as const;
 const rcl1ProgressTotal = 200;
-const rcl2ProgressTotal = 45000;
-const totalProgressToRcl3 = rcl1ProgressTotal + rcl2ProgressTotal;
+const totalProgressToRcl3 = rcl1ProgressTotal + 45000;
 const rcl2ExtensionTarget = 5;
 
 export function shouldCaptureRunSample(
@@ -28,13 +27,24 @@ export function shouldCaptureRunSample(
 }
 
 export function buildRunSummaryMetrics(samples: RunSample[], sampleEveryTicks: number): RunSummaryMetrics {
+  const roles = collectRoles(samples);
+
   return {
     sampleEveryTicks,
-    users: {
-      baseline: summarizeVariant(samples, "baseline"),
-      candidate: summarizeVariant(samples, "candidate")
-    }
+    users: Object.fromEntries(roles.map((role) => [role, summarizeVariant(samples, role)])) as RoleRecord<UserRunSummaryMetrics>
   };
+}
+
+function collectRoles(samples: RunSample[]): VariantRole[] {
+  const roles = new Set<VariantRole>();
+
+  for (const sample of samples) {
+    for (const role of Object.keys(sample.users) as VariantRole[]) {
+      roles.add(role);
+    }
+  }
+
+  return [...roles];
 }
 
 function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSummaryMetrics {
@@ -45,8 +55,7 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
   let maxOwnedControllers = 0;
   let firstExtensionTick: number | null = null;
   let allRcl2ExtensionsTick: number | null = null;
-  let telemetrySampleCount = 0;
-  let spawnIdleSamples = 0;
+  let sampleCount = 0;
   let nexusTelemetrySampleCount = 0;
   let nexusSpawnEventSamples = 0;
   let nexusTotalSpawnEvents = 0;
@@ -63,15 +72,6 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
   let nexusTotalChurnRate = 0;
   let nexusRoadCoverageSamples = 0;
   let nexusTotalRoadCoverage = 0;
-  let sourceCoverageSamples = 0;
-  let totalSourceCoverage = 0;
-  let fullyStaffedSamples = 0;
-  let harvestingSourceCoverageSamples = 0;
-  let totalHarvestingSourceCoverage = 0;
-  let fullyHarvestingStaffedSamples = 0;
-  let activeHarvestingSourceCoverageSamples = 0;
-  let totalActiveHarvestingSourceCoverage = 0;
-  let fullyActiveHarvestingStaffedSamples = 0;
 
   for (const sample of samples) {
     const stats = sample.users[role];
@@ -79,6 +79,7 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
       continue;
     }
 
+    sampleCount += 1;
     firstSeenGameTime ??= sample.gameTime;
     maxCombinedRCL = Math.max(maxCombinedRCL, stats.combinedRCL);
     maxOwnedControllers = Math.max(maxOwnedControllers, stats.ownedControllers);
@@ -103,39 +104,6 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
       }
       if (allRcl2ExtensionsTick === null && extensions >= rcl2ExtensionTarget) {
         allRcl2ExtensionsTick = sample.gameTime;
-      }
-    }
-
-    const telemetry = sample.telemetry?.[role];
-    if (!telemetry) {
-      continue;
-    }
-
-    telemetrySampleCount += 1;
-
-    if (telemetry.spawn && telemetry.spawn.queueDepth > 0 && !telemetry.spawn.isSpawning) {
-      spawnIdleSamples += 1;
-    }
-
-    if (telemetry.sources && telemetry.sources.total > 0) {
-      sourceCoverageSamples += 1;
-      totalSourceCoverage += telemetry.sources.staffed / telemetry.sources.total;
-      if (telemetry.sources.staffed >= telemetry.sources.total) {
-        fullyStaffedSamples += 1;
-      }
-
-      harvestingSourceCoverageSamples += 1;
-      totalHarvestingSourceCoverage += telemetry.sources.harvestingStaffed / telemetry.sources.total;
-      if (telemetry.sources.harvestingStaffed >= telemetry.sources.total) {
-        fullyHarvestingStaffedSamples += 1;
-      }
-
-      if (typeof telemetry.sources.activeHarvestingStaffed === "number") {
-        activeHarvestingSourceCoverageSamples += 1;
-        totalActiveHarvestingSourceCoverage += telemetry.sources.activeHarvestingStaffed / telemetry.sources.total;
-        if (telemetry.sources.activeHarvestingStaffed >= telemetry.sources.total) {
-          fullyActiveHarvestingStaffedSamples += 1;
-        }
       }
     }
 
@@ -189,7 +157,7 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
   }
 
   return {
-    sampleCount: samples.length,
+    sampleCount,
     firstSeenGameTime,
     controllerLevelMilestones,
     controllerProgressToRCL3Pct,
@@ -197,14 +165,6 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
     maxOwnedControllers,
     firstExtensionTick,
     allRcl2ExtensionsTick,
-    telemetrySampleCount,
-    spawnWaitingForSufficientEnergyPct: toPercent(spawnIdleSamples, telemetrySampleCount),
-    sourceCoveragePct: toPercent(totalSourceCoverage, sourceCoverageSamples),
-    sourceUptimePct: toPercent(fullyStaffedSamples, sourceCoverageSamples),
-    harvestingSourceCoveragePct: toPercent(totalHarvestingSourceCoverage, harvestingSourceCoverageSamples),
-    harvestingSourceUptimePct: toPercent(fullyHarvestingStaffedSamples, harvestingSourceCoverageSamples),
-    activeHarvestingSourceCoveragePct: toPercent(totalActiveHarvestingSourceCoverage, activeHarvestingSourceCoverageSamples),
-    activeHarvestingSourceUptimePct: toPercent(fullyActiveHarvestingStaffedSamples, activeHarvestingSourceCoverageSamples),
     nexusTelemetrySampleCount,
     nexusSpawnEfficiencyPct: nexusSpawnEventSamples > 0
       ? toPercent(nexusTotalSpawnEvents, nexusTotalSpawnEvents + nexusTotalIdleSpawnTicks)
@@ -264,11 +224,7 @@ function normalizeControllerProgressToRcl3Pct(progress: number): number {
   return Math.round((boundedProgress / totalProgressToRcl3) * 10000) / 100;
 }
 
-function toPercent(value: number, total: number): number | null {
-  if (total === 0) {
-    return null;
-  }
-
-  const ratio = value / total;
-  return Math.round(ratio * 10000) / 100;
+function toPercent(numerator: number, denominator: number): number | null {
+  if (denominator <= 0) return null;
+  return Math.round((numerator / denominator) * 10000) / 100;
 }

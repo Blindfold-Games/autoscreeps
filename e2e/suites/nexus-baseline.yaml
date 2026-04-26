@@ -1,16 +1,7 @@
 version: 1
 name: nexus-baseline
 description: Nexus vs nexus baseline suite - validate opener speed and subsystem efficiency.
-gates:
-  primaryMetrics:
-    - T_RCL3
-    - nexusSpawnEfficiencyPct
-    - nexusSourceCoveragePct
-    - nexusCortexSkipRatePct
-  training:
-    minImprovedPrimaryMetrics: 2
-  holdout:
-    maxRegressionPct: 5
+mode: duel
 cases:
   - id: opener-train-1
     cohort: train

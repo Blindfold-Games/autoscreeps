@@ -1,153 +1,108 @@
 import { describe, expect, it } from "vitest";
-import { buildTelemetryByRole, parseBotTelemetry } from "../src/lib/bot-telemetry.ts";
+import { buildReportsByRole, inspectBotReport, inspectReportsByRole, parseBotReport } from "../src/lib/bot-telemetry.ts";
 
-describe("bot telemetry", () => {
-  it("parses a valid telemetry payload", () => {
-    const parsed = parseBotTelemetry(JSON.stringify({
-      schemaVersion: 5,
+describe("bot report", () => {
+  it("parses a valid report payload with opaque telemetry", () => {
+    const raw = JSON.stringify({
+      schemaVersion: 11,
       gameTime: 250,
-      colonyMode: "normal",
-      totalCreeps: 4,
-      roleCounts: { harvester: 2, upgrader: 2 },
-      spawn: {
-        queueDepth: 1,
-        isSpawning: false,
-        nextRole: "harvester",
-        unmetDemand: { harvester: 1, upgrader: 0 }
-      },
-      sources: {
-        total: 2,
-        staffed: 1,
-        assignments: { sourceA: 1 },
-        harvestingStaffed: 1,
-        harvestingAssignments: { sourceA: 1 },
-        activeHarvestingStaffed: 1,
-        activeHarvestingAssignments: { sourceA: 1 },
-        adjacentHarvesters: { sourceA: 1 },
-        successfulHarvestTicks: { sourceA: 25 },
-        dropEnergy: { sourceA: 50 },
-        oldestDropAge: { sourceA: 10 },
-        overAssigned: { sourceA: 0 },
-        backlogEnergy: 50
-      },
-      loop: {
-        phaseTicks: { "harvester.gathering": 10 },
-        actionAttempts: { "harvester.harvest": 10 },
-        actionSuccesses: { "harvester.harvest": 8 },
-        actionFailures: { "harvester.harvest.-9": 2 },
-        targetFailures: { "harvester.no_source": 1 },
-        workingStateFlips: { "harvester.gather_to_work": 2 },
-        cargoUtilizationTicks: { harvester: 3 },
-        noTargetTicks: { harvester: 1 },
-        withEnergyNoSpendTicks: { upgrader: 2 },
-        noEnergyAvailableTicks: { upgrader: 1 },
-        sourceAssignmentTicks: { harvester: 10 },
-        sourceAdjacencyTicks: { harvester: 8 },
-        samePositionTicks: { harvester: 4 },
-        energyGained: { harvester: 32 },
-        energySpent: { upgrader: 10 },
-        energySpentOnBuild: 5,
-        energySpentOnUpgrade: 5,
-        deliveredEnergyByTargetType: { spawn: 20 },
-        transferSuccessByTargetType: { spawn: 2 },
-        workerTaskSelections: { build: 1 },
-        sourceDropPickupLatencyTotal: 15,
-        sourceDropPickupLatencySamples: 1,
-        pickupToSpendLatencyTotal: 8,
-        pickupToSpendLatencySamples: 1
-      },
-      creeps: {
-        harvesterA: {
-          role: "harvester",
-          ticksSinceSuccess: 3,
-          lastSuccessfulAction: "harvest",
-          samePositionTicks: 1,
-          targetSwitches: 2,
-          lastTarget: "sourceA"
+      errors: [],
+      telemetry: {
+        colonyMode: "normal",
+        loop: { phaseTicks: { "worker.upgrade": 10 } }
+      }
+    });
+
+    expect(parseBotReport(raw)).toEqual({
+      schemaVersion: 11,
+      gameTime: 250,
+      errors: [],
+      telemetry: {
+        colonyMode: "normal",
+        loop: { phaseTicks: { "worker.upgrade": 10 } }
+      }
+    });
+    expect(inspectBotReport(raw)).toEqual({
+      snapshot: {
+        schemaVersion: 11,
+        gameTime: 250,
+        errors: [],
+        telemetry: {
+          colonyMode: "normal",
+          loop: { phaseTicks: { "worker.upgrade": 10 } }
         }
       },
-      milestones: { rcl2Tick: 125 },
-      counters: { creepDeaths: 3 }
-    }));
-
-    expect(parsed).toEqual({
-      schemaVersion: 5,
-      gameTime: 250,
-      colonyMode: "normal",
-      totalCreeps: 4,
-      roleCounts: { harvester: 2, upgrader: 2 },
-      spawn: {
-        queueDepth: 1,
-        isSpawning: false,
-        nextRole: "harvester",
-        unmetDemand: { harvester: 1, upgrader: 0 }
-      },
-      sources: {
-        total: 2,
-        staffed: 1,
-        assignments: { sourceA: 1 },
-        harvestingStaffed: 1,
-        harvestingAssignments: { sourceA: 1 },
-        activeHarvestingStaffed: 1,
-        activeHarvestingAssignments: { sourceA: 1 },
-        adjacentHarvesters: { sourceA: 1 },
-        successfulHarvestTicks: { sourceA: 25 },
-        dropEnergy: { sourceA: 50 },
-        oldestDropAge: { sourceA: 10 },
-        overAssigned: { sourceA: 0 },
-        backlogEnergy: 50
-      },
-      loop: {
-        phaseTicks: { "harvester.gathering": 10 },
-        actionAttempts: { "harvester.harvest": 10 },
-        actionSuccesses: { "harvester.harvest": 8 },
-        actionFailures: { "harvester.harvest.-9": 2 },
-        targetFailures: { "harvester.no_source": 1 },
-        workingStateFlips: { "harvester.gather_to_work": 2 },
-        cargoUtilizationTicks: { harvester: 3 },
-        noTargetTicks: { harvester: 1 },
-        withEnergyNoSpendTicks: { upgrader: 2 },
-        noEnergyAvailableTicks: { upgrader: 1 },
-        sourceAssignmentTicks: { harvester: 10 },
-        sourceAdjacencyTicks: { harvester: 8 },
-        samePositionTicks: { harvester: 4 },
-        energyGained: { harvester: 32 },
-        energySpent: { upgrader: 10 },
-        energySpentOnBuild: 5,
-        energySpentOnUpgrade: 5,
-        deliveredEnergyByTargetType: { spawn: 20 },
-        transferSuccessByTargetType: { spawn: 2 },
-        workerTaskSelections: { build: 1 },
-        sourceDropPickupLatencyTotal: 15,
-        sourceDropPickupLatencySamples: 1,
-        pickupToSpendLatencyTotal: 8,
-        pickupToSpendLatencySamples: 1
-      },
-      creeps: {
-        harvesterA: {
-          role: "harvester",
-          ticksSinceSuccess: 3,
-          lastSuccessfulAction: "harvest",
-          samePositionTicks: 1,
-          targetSwitches: 2,
-          lastTarget: "sourceA"
-        }
-      },
-      milestones: { rcl2Tick: 125 },
-      counters: { creepDeaths: 3 }
+      health: {
+        status: "ok",
+        message: null
+      }
     });
   });
 
-  it("returns null for malformed telemetry and builds role maps", () => {
-    expect(parseBotTelemetry("{bad json")).toBeNull();
-    expect(parseBotTelemetry(JSON.stringify({ schemaVersion: "1", gameTime: 25 }))).toBeNull();
+  it("classifies malformed and missing report health", () => {
+    expect(parseBotReport("{bad json")).toBeNull();
+    expect(parseBotReport(JSON.stringify({ schemaVersion: "1", gameTime: 25, errors: [] }))).toBeNull();
+    expect(parseBotReport(JSON.stringify({ schemaVersion: 1, gameTime: 25, errors: [1] }))).toBeNull();
+    expect(inspectBotReport("{bad json")).toMatchObject({
+      snapshot: null,
+      health: {
+        status: "parse_error"
+      }
+    });
+    expect(inspectBotReport(null)).toEqual({
+      snapshot: null,
+      health: {
+        status: "missing",
+        message: null
+      }
+    });
+  });
 
-    expect(buildTelemetryByRole({
-      baseline: JSON.stringify({ schemaVersion: 1, gameTime: 25 }),
+  it("preserves reported bot errors without treating them as parse failures", () => {
+    expect(inspectBotReport(JSON.stringify({
+      schemaVersion: 5,
+      gameTime: 250,
+      errors: ["spawn queue invariant violated"]
+    }))).toEqual({
+      snapshot: {
+        schemaVersion: 5,
+        gameTime: 250,
+        errors: ["spawn queue invariant violated"]
+      },
+      health: {
+        status: "ok",
+        message: null
+      }
+    });
+  });
+
+  it("builds report and health maps by role", () => {
+    expect(buildReportsByRole({
+      baseline: JSON.stringify({ schemaVersion: 1, gameTime: 25, errors: [] }),
       candidate: null
     })).toEqual({
-      baseline: { schemaVersion: 1, gameTime: 25 },
+      baseline: { schemaVersion: 1, gameTime: 25, errors: [] },
       candidate: null
+    });
+
+    expect(inspectReportsByRole({
+      baseline: JSON.stringify({ schemaVersion: 1, gameTime: 25, errors: [] }),
+      candidate: null
+    })).toEqual({
+      baseline: {
+        snapshot: { schemaVersion: 1, gameTime: 25, errors: [] },
+        health: {
+          status: "ok",
+          message: null
+        }
+      },
+      candidate: {
+        snapshot: null,
+        health: {
+          status: "missing",
+          message: null
+        }
+      }
     });
   });
 });
