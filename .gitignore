@@ -1,4 +1,6 @@
 references/
 .env
 .autoscreeps/
+.playwright-cli/
 .playwright-mcp/
+bots/advanced

@@ -12,6 +12,7 @@ import type {
   RunMetrics,
   RunRecord,
   RunSample,
+  RunSampleRoomImage,
   RunSampleRoomMetrics,
   RunTerminationReason,
   TerminalOutcome,
@@ -21,14 +22,16 @@ import type {
   UserWorldStatus,
   VariantInput,
   VariantRecord,
-  VariantRole
+  VariantRole,
+  ScreepsModule
 } from "./contracts.ts";
-import { autoscreepsReportSegmentId, inspectReportsByRole, nexusTelemetrySegmentId, type BotReportInspection } from "./bot-telemetry.ts";
-import { buildNexusTelemetryByRole } from "./nexus-telemetry.ts";
-import { copyFileToScreepsService, resetPrivateServer, restartScreepsService } from "./docker.ts";
+import { autoscreepsReportSegmentId, inspectReportsByRole, type BotReportInspection } from "./bot-telemetry.ts";
+import { resetPrivateServer, restartScreepsService, startScreepsService, stopScreepsService } from "./docker.ts";
 import { createWorkspaceSnapshot, parseVariantSource, resolveRepoRoot, withGitWorktree } from "./git.ts";
 import { appendEvent, appendIndexEntry, appendRunSample, createRunWorkspace, writeMetrics, writeRunRecord, writeVariantRecords } from "./history.ts";
 import { generateExperimentMap } from "./map-generator.ts";
+import { importMapFileOffline } from "./offline-map-import.ts";
+import { writeRoomImageArtifact } from "./room-image.ts";
 import { buildRunSummaryMetrics, shouldCaptureRunSample } from "./run-samples.ts";
 import { loadScenario } from "./scenario.ts";
 import type { ScenarioConfig, ScenarioRoomMutation, TerminalCondition, TerminalConditionSet } from "./scenario.ts";
@@ -101,7 +104,7 @@ type ExperimentRunInput = {
 
 type PreparedVariant = {
   record: VariantRecord;
-  modules: Record<string, string>;
+  modules: Record<string, ScreepsModule>;
 };
 
 const spectatorCredentials = {
@@ -281,33 +284,44 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
       port: runRecord.server.cliPort
     });
 
-    await Promise.all([api.waitForReady(), cli.waitForReady()]);
+    await waitForServerControlReady({
+      api,
+      cli,
+      tickDuration: runRecord.run.tickDuration
+    });
     await logEvent(runDir, "info", "server.ready", "Private server HTTP and CLI endpoints are ready.");
 
-    await cli.pauseSimulation();
-    await cli.setTickDuration(runRecord.run.tickDuration);
     if (world.import.kind === "map-id") {
       await logEvent(runDir, "info", "server.map", "Importing scenario map.", { map: world.label });
       await cli.importMap(world.import.value);
       await logEvent(runDir, "info", "server.restart", "Restarting the Screeps service after map import.");
       await restartScreepsService(repoRoot);
-      await Promise.all([api.waitForReady(), cli.waitForReady()]);
-      await cli.pauseSimulation();
-      await cli.setTickDuration(runRecord.run.tickDuration);
+      await waitForServerControlReady({
+        api,
+        cli,
+        tickDuration: runRecord.run.tickDuration
+      });
     }
 
     if (world.import.kind === "map-file") {
+      const mapLabel = world.label ?? path.basename(world.import.hostFilePath);
       await logEvent(runDir, "info", "server.map", "Importing generated scenario map file.", {
-        map: world.label,
+        map: mapLabel,
         file: path.relative(repoRoot, world.import.hostFilePath)
       });
-      await copyFileToScreepsService(repoRoot, world.import.hostFilePath, world.import.containerFilePath);
-      await cli.importMapFile(world.import.containerFilePath);
-      await logEvent(runDir, "info", "server.restart", "Restarting the Screeps service after map import.");
-      await restartScreepsService(repoRoot);
-      await Promise.all([api.waitForReady(), cli.waitForReady()]);
-      await cli.pauseSimulation();
-      await cli.setTickDuration(runRecord.run.tickDuration);
+      await stopScreepsService(repoRoot);
+      let importResult;
+      try {
+        importResult = await importMapFileOffline(world.import.hostFilePath, mapLabel);
+      } finally {
+        await startScreepsService(repoRoot);
+      }
+      await logEvent(runDir, "info", "server.mapImported", "Imported generated scenario map while the Screeps service was stopped.", importResult);
+      await waitForServerControlReady({
+        api,
+        cli,
+        tickDuration: runRecord.run.tickDuration
+      });
     }
 
     await api.registerUser({
@@ -354,7 +368,6 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
     runRecord.run.startGameTime = await cli.getGameTime();
     const targetGameTime = runRecord.run.startGameTime + runRecord.run.maxTicks;
     const sampleEveryTicks = scenario.config.run.sampleEveryTicks;
-    const isNexus = scenario.config.bot === "nexus";
     const terminalOutcomes = Object.fromEntries(roles.map((role) => [role, null])) as RoleRecord<TerminalOutcome | null>;
     const samples: RunSample[] = [];
     const terminalConditionsNeedRooms = terminalConditionsRequireRoomObjects(runRecord.run.terminalConditions);
@@ -371,6 +384,37 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
 
     let lastProcessedGameTime = runRecord.run.startGameTime;
     let lastSampleGameTime: number | null = null;
+    const terrainByRoom = new Map<string, string>();
+    let roomImageCaptureFailed = false;
+
+    const attachRoomImages = async (sample: RunSample, gameTime: number, roomObjectsByRole: RoleRecord<RoomObjectsResponse>): Promise<void> => {
+      if (roomImageCaptureFailed) {
+        return;
+      }
+
+      try {
+        const roomImages = await captureRunRoomImages({
+          api,
+          runDir,
+          gameTime,
+          roles,
+          rooms: runRecord.rooms,
+          roomObjectsByRole,
+          terrainByRoom
+        });
+        if (Object.keys(roomImages).length > 0) {
+          sample.roomImages = roomImages;
+        }
+      } catch (error) {
+        if (!roomImageCaptureFailed) {
+          roomImageCaptureFailed = true;
+          await logEvent(runDir, "error", "roomImage.failed", "Failed to capture deterministic room images.", {
+            gameTime,
+            error: error instanceof Error ? error.stack ?? error.message : String(error)
+          });
+        }
+      }
+    };
 
     const waitResult = await waitForSimulation({
       cli,
@@ -389,17 +433,7 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
           roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, autoscreepsReportSegmentId)] as const)
         );
         const reportsByRole = inspectReportsByRole(Object.fromEntries(reportEntries) as RoleRecord<string | null>);
-        if (!isNexus) {
-          await ensureReportsHealthy(runDir, gameTime, reportsByRole, roles);
-        }
-
-        let nexusTelemetryByRole: ReturnType<typeof buildNexusTelemetryByRole> | null = null;
-        if (isNexus) {
-          const nexusEntries = await Promise.all(
-            roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, nexusTelemetrySegmentId)] as const)
-          );
-          nexusTelemetryByRole = buildNexusTelemetryByRole(Object.fromEntries(nexusEntries) as Record<VariantRole, string | null>);
-        }
+        await ensureReportsHealthy(runDir, gameTime, reportsByRole, roles);
 
         if (pendingRoomMutations.length > 0) {
           pendingRoomMutations = await applyScenarioRoomMutations({
@@ -457,7 +491,10 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
         }
 
         if (captureSample && stats) {
-          const sample = buildRunSample(gameTime, stats, credentials, runRecord.rooms, reportsByRole, nexusTelemetryByRole, roomObjectsByRole, roles);
+          const sample = buildRunSample(gameTime, stats, credentials, runRecord.rooms, reportsByRole, roomObjectsByRole, roles);
+          if (roomObjectsByRole) {
+            await attachRoomImages(sample, gameTime, roomObjectsByRole);
+          }
           samples.push(sample);
           lastSampleGameTime = gameTime;
           await appendRunSample(runDir, sample);
@@ -520,31 +557,21 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
         roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, autoscreepsReportSegmentId)] as const)
       );
       const reportsByRole = inspectReportsByRole(Object.fromEntries(reportEntries) as RoleRecord<string | null>);
-      if (!isNexus) {
-        await ensureReportsHealthy(runDir, endGameTime, reportsByRole, roles);
-      }
-
-      let finalNexusTelemetryByRole: ReturnType<typeof buildNexusTelemetryByRole> | null = null;
-      if (isNexus) {
-        const nexusEntries = await Promise.all(
-          roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, nexusTelemetrySegmentId)] as const)
-        );
-        finalNexusTelemetryByRole = buildNexusTelemetryByRole(Object.fromEntries(nexusEntries) as Record<VariantRole, string | null>);
-      }
-
+      await ensureReportsHealthy(runDir, endGameTime, reportsByRole, roles);
       const roomEntries = await Promise.all(
         roles.map(async (role) => [role, await api.getRoomObjects(runRecord.rooms[role]!)] as const)
       );
+      const finalRoomObjectsByRole = Object.fromEntries(roomEntries) as RoleRecord<RoomObjectsResponse>;
       const finalSample = buildRunSample(
         endGameTime,
         finalStats,
         credentials,
         runRecord.rooms,
         reportsByRole,
-        finalNexusTelemetryByRole,
-        Object.fromEntries(roomEntries) as RoleRecord<RoomObjectsResponse>,
+        finalRoomObjectsByRole,
         roles
       );
+      await attachRoomImages(finalSample, endGameTime, finalRoomObjectsByRole);
       samples.push(finalSample);
       await appendRunSample(runDir, finalSample);
     }
@@ -606,6 +633,40 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
   };
 }
 
+async function waitForServerControlReady(input: {
+  api: ScreepsApiClient;
+  cli: ScreepsServerCli;
+  tickDuration: number;
+  timeoutMs?: number;
+}): Promise<void> {
+  const timeoutMs = input.timeoutMs ?? 120000;
+  const start = Date.now();
+  let lastError: unknown = null;
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await Promise.all([input.api.waitForReady(30000), input.cli.waitForReady(30000)]);
+      await input.cli.pauseSimulation();
+      await input.cli.setTickDuration(input.tickDuration);
+      return;
+    } catch (error) {
+      lastError = error;
+      await waitForServerControlRetryDelay(1000);
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  throw new Error("Timed out waiting for the Screeps server control plane to become ready.");
+}
+
+function waitForServerControlRetryDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 async function prepareVariant(input: {
   repoRoot: string;
   runDir: string;
@@ -618,7 +679,7 @@ async function prepareVariant(input: {
   if (parsedSource.kind === "workspace") {
     const patchPath = path.join(input.runDir, `${input.role}.patch`);
     const snapshot = await createWorkspaceSnapshot(input.repoRoot, patchPath);
-    const { bundle, record } = await buildVariantPackage(input.repoRoot, input.packagePath, "auto");
+    const { modules, record } = await buildVariantPackage(input.repoRoot, input.packagePath, "auto");
 
     return {
       record: {
@@ -626,14 +687,12 @@ async function prepareVariant(input: {
         snapshot,
         build: record
       },
-      modules: {
-        main: bundle
-      }
+      modules
     };
   }
 
   return await withGitWorktree(input.repoRoot, parsedSource.ref, async (worktreeRoot, resolvedSha) => {
-    const { bundle, record } = await buildVariantPackage(worktreeRoot, input.packagePath, "ci");
+    const { modules, record } = await buildVariantPackage(worktreeRoot, input.packagePath, "ci");
     return {
       record: {
         role: input.role,
@@ -645,9 +704,7 @@ async function prepareVariant(input: {
         },
         build: record
       },
-      modules: {
-        main: bundle
-      }
+      modules
     };
   });
 }
@@ -778,6 +835,46 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+async function captureRunRoomImages(input: {
+  api: Pick<ScreepsApiClient, "getRoomTerrain">;
+  runDir: string;
+  gameTime: number;
+  roles: VariantRole[];
+  rooms: RoleRecord<string>;
+  roomObjectsByRole: RoleRecord<RoomObjectsResponse>;
+  terrainByRoom: Map<string, string>;
+}): Promise<RoleRecord<RunSampleRoomImage>> {
+  const entries = await Promise.all(
+    input.roles.map(async (role) => {
+      const room = input.rooms[role];
+      const roomObjects = input.roomObjectsByRole[role];
+      if (!room || !roomObjects) {
+        return null;
+      }
+
+      let terrain = input.terrainByRoom.get(room);
+      if (!terrain) {
+        terrain = await input.api.getRoomTerrain(room);
+        input.terrainByRoom.set(room, terrain);
+      }
+
+      return [
+        role,
+        await writeRoomImageArtifact({
+          runDir: input.runDir,
+          role,
+          gameTime: input.gameTime,
+          room,
+          terrain,
+          roomObjects
+        })
+      ] as const;
+    })
+  );
+
+  return Object.fromEntries(entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null)) as RoleRecord<RunSampleRoomImage>;
+}
+
 function summarizeUserTerminalStats(
   stats: StatsResponse,
   username: string,
@@ -835,7 +932,6 @@ function buildRunSample(
   credentials: RoleRecord<{ username: string }>,
   rooms: RoleRecord<string>,
   reportData: ReportInspectionsByRole,
-  nexusTelemetryByRole: ReturnType<typeof buildNexusTelemetryByRole> | null,
   roomObjectsByRole: RoleRecord<RoomObjectsResponse> | null,
   roles: VariantRole[]
 ): RunSample {
@@ -863,10 +959,6 @@ function buildRunSample(
   sample.reports = Object.fromEntries(
     roles.map((role) => [role, reportData[role]?.snapshot ?? null])
   ) as RunSample["reports"];
-
-  if (nexusTelemetryByRole !== null) {
-    sample.nexusTelemetry = nexusTelemetryByRole;
-  }
 
   return sample;
 }

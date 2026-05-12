@@ -1,0 +1,2323 @@
+import { createDijkstraMap, dijkstraUnreachable, type DijkstraMap } from "./dijkstra-map.ts";
+import { createTerrainDistanceTransform } from "./distance-transform.ts";
+import {
+  createRepairableDijkstraMap,
+  createRepairableDijkstraScratch,
+  getRepairedDijkstraDistance,
+  type RepairableDijkstraMap,
+  type RepairableDijkstraScratch
+} from "./repairable-dijkstra-map.ts";
+import {
+  isConstructionSiteCoordinate,
+  isConstructionSiteTerrainAllowed,
+  isRoadPlanningTerrain,
+  isWalkableTerrain,
+  type ConstructionSiteStructureType
+} from "./construction-rules.ts";
+import type { RoomPlanningObject, RoomPlanningPolicy, RoomPlanningRoomData } from "./room-plan.ts";
+import { solveWeightedMinCut, type WeightedMinCutEdge } from "./weighted-min-cut.ts";
+
+const roomSize = 50;
+const roomArea = roomSize * roomSize;
+const defaultTopK = 3;
+const fallbackTopKs = [3, 5, 8] as const;
+const exactCandidateWindowMultiplier = 24;
+const controllerStampReserveRange = 3;
+const sourceStampReserveRange = 2;
+const provisionalCutImpossibleCapacity = 1_000_000;
+
+export type StampKind = "hub" | "fastfiller" | "labs";
+export type StampRotation = 0 | 90 | 180 | 270;
+
+export type RoomStampAnchor = {
+  x: number;
+  y: number;
+};
+
+export type StampPlacement = {
+  kind: StampKind;
+  label: string;
+  rotation: StampRotation;
+  anchor: RoomStampAnchor;
+  anchors: Record<string, RoomStampAnchor>;
+  blockedTiles: number[];
+  pathBlockedTiles?: number[];
+  roadTiles?: number[];
+  score: number[];
+};
+
+export type StampSearchOptions = {
+  topK?: number;
+  validateCompleteLayout?: (plan: RoomStampPlan) => boolean;
+};
+
+export type PlanningBudget = {
+  shouldYield(): boolean;
+};
+
+export type RoomStampPlan = {
+  roomName: string;
+  policy: RoomPlanningPolicy;
+  topK: number;
+  score: number[];
+  stamps: {
+    hub: StampPlacement;
+    fastfillers: [StampPlacement, StampPlacement];
+    labs: StampPlacement | null;
+  };
+};
+
+export type StampCandidateSummary = {
+  key: string;
+  kind: StampKind;
+  label: string;
+  rank: number;
+  rotation: StampRotation;
+  anchor: RoomStampAnchor;
+  anchors: Record<string, RoomStampAnchor>;
+  blockedTiles: number[];
+  score: number[];
+  rejected: false;
+};
+
+export type StampSearchDebugPhase = {
+  name: string;
+  selectedLabel: string | null;
+  candidates: StampCandidateSummary[];
+};
+
+export type StampSearchDebug = {
+  roomName: string;
+  policy: RoomPlanningPolicy;
+  topK: number;
+  phases: StampSearchDebugPhase[];
+};
+
+export type StampSearchTreeNode = {
+  id: string;
+  candidate: StampCandidateSummary;
+  selected: boolean;
+  completeScore?: number[];
+  children: StampSearchTreeNode[];
+};
+
+export type StampPlacementInteractiveDebug = {
+  roomName: string;
+  policy: RoomPlanningPolicy;
+  topK: number;
+  score: number[];
+  selectedPath: string[];
+  tree: StampSearchTreeNode[];
+};
+
+type Coord = {
+  x: number;
+  y: number;
+};
+
+type StampTemplate = {
+  kind: StampKind;
+  label: string;
+  rotations: readonly StampRotation[];
+  blockedOffsets: Coord[];
+  pathBlockedOffsets?: Coord[];
+  roadOffsets?: Coord[];
+  anchors: Record<string, Coord>;
+};
+
+type RoomFeatures = {
+  roomName: string;
+  terrain: string;
+  controller: RoomPlanningObject;
+  sources: [RoomPlanningObject, RoomPlanningObject];
+  mineral: RoomPlanningObject | null;
+  exits: Coord[];
+  baseOccupied: Uint8Array;
+  basePathBlocked: Uint8Array;
+  reservedPathMasks: ReservedPathMasks;
+  terrainDistanceTransform: ReturnType<typeof createTerrainDistanceTransform>;
+  exitDistanceMap: DijkstraMap;
+  projectedNormalHubCandidates: Candidate[];
+  projectedTempleHubCandidates: Candidate[];
+  projectedFastfillerCandidates: Candidate[];
+  projectedLabCandidates: Candidate[];
+};
+
+type ReservedPathMasks = {
+  default: Uint8Array;
+  edgeOrigin: Uint8Array;
+  sourceOrigins: [Uint8Array, Uint8Array];
+};
+
+type ReservedPathExemption =
+  | { kind: "edge" }
+  | { kind: "source"; index: number }
+  | null;
+
+type PlacementState = {
+  occupied: Uint8Array;
+  pathBlocked: Uint8Array;
+  placements: StampPlacement[];
+};
+
+type PathContext = {
+  storageDistanceMap: RepairableDijkstraMap | null;
+  terminalDistanceMap: RepairableDijkstraMap | null;
+  sourceDistanceMaps: [DijkstraMap | null, DijkstraMap | null];
+  storageToSourceDistances: [number, number];
+  repairScratch: RepairableDijkstraScratch;
+};
+
+type Candidate = StampPlacement & {
+  sourceDetours?: [number, number];
+  storageDistance?: number;
+  labDistance?: number;
+  labStorageDistance?: number;
+  labTerminalDistance?: number;
+};
+
+type FastfillerScore = {
+  storageDistance: number;
+  sourceDetours: [number, number];
+};
+
+type LabScore = {
+  storageDistance: number;
+  terminalDistance: number;
+  totalDistance: number;
+};
+
+type SearchResult = {
+  plan: RoomStampPlan;
+  branch: {
+    hub: StampPlacement;
+    pod1: StampPlacement;
+    pod2: StampPlacement;
+    labs: StampPlacement | null;
+  };
+};
+
+export type RoomStampPlanningJob = {
+  roomName: string;
+  policy: RoomPlanningPolicy;
+  stage: string;
+  advance(budget?: PlanningBudget | null): RoomStampPlan | null;
+};
+
+type ExactCandidate = {
+  preliminaryIndex: number;
+  candidate: Candidate;
+};
+
+type ExpandableCandidateSet = {
+  preliminary: Candidate[];
+  exactCandidates: ExactCandidate[];
+  evaluated: number;
+};
+
+type FastfillerCandidateSet = ExpandableCandidateSet & {
+  paths: PathContext;
+};
+
+type LabCandidateSet = ExpandableCandidateSet & {
+  paths: PathContext;
+};
+
+type CandidateGenerationCache = {
+  fastfillers: Map<string, FastfillerCandidateSet>;
+  labs: Map<string, LabCandidateSet>;
+};
+
+export function planRoomStamps(room: RoomPlanningRoomData, policy: RoomPlanningPolicy, options: StampSearchOptions = {}): RoomStampPlan {
+  return searchStampPlacements(room, policy, options).plan;
+}
+
+export function createRoomStampPlanningJob(
+  room: RoomPlanningRoomData,
+  policy: RoomPlanningPolicy,
+  options: StampSearchOptions = {}
+): RoomStampPlanningJob {
+  return new ResumableRoomStampPlanningJob(room, policy, options);
+}
+
+export function createStampPlacementDebug(
+  room: RoomPlanningRoomData,
+  policy: RoomPlanningPolicy,
+  plan: RoomStampPlan,
+  options: StampSearchOptions = {}
+): StampSearchDebug {
+  const topK = normalizeTopK(options.topK ?? plan.topK);
+  const features = createRoomFeatures(room);
+  const baseState = createBaseState(features);
+  const hubCandidates = generateHubCandidates(features, baseState, policy, topK);
+  const hubState = placeStamp(baseState, plan.stamps.hub);
+  const pod1Candidates = generateFastfillerCandidates(features, hubState, plan.stamps.hub, topK);
+  const pod1State = placeStamp(hubState, plan.stamps.fastfillers[0]);
+  const pod2Candidates = generateFastfillerCandidates(features, pod1State, plan.stamps.hub, topK);
+  const pod2State = placeStamp(pod1State, plan.stamps.fastfillers[1]);
+  const labCandidates = policy === "normal" ? generateLabCandidates(features, pod2State, plan.stamps.hub, topK) : [];
+
+  return {
+    roomName: room.roomName,
+    policy,
+    topK,
+    phases: [
+      createDebugPhase("hub candidates", hubCandidates, plan.stamps.hub),
+      createDebugPhase("pod1 candidates after hub", pod1Candidates, plan.stamps.fastfillers[0]),
+      createDebugPhase("pod2 candidates after hub + pod1", pod2Candidates, plan.stamps.fastfillers[1]),
+      ...(policy === "normal" ? [createDebugPhase("lab candidates after fastfillers", labCandidates, plan.stamps.labs)] : [])
+    ]
+  };
+}
+
+export function createInteractiveStampPlacementDebug(
+  room: RoomPlanningRoomData,
+  policy: RoomPlanningPolicy,
+  plan: RoomStampPlan,
+  options: StampSearchOptions = {}
+): StampPlacementInteractiveDebug {
+  const topK = normalizeTopK(options.topK ?? plan.topK);
+  const features = createRoomFeatures(room);
+  const baseState = createBaseState(features);
+  const hubCandidates = generateHubCandidates(features, baseState, policy, topK);
+  const selectedHubKey = candidateStableKey(plan.stamps.hub);
+  const selectedPod1Key = candidateStableKey(plan.stamps.fastfillers[0]);
+  const selectedPod2Key = candidateStableKey(plan.stamps.fastfillers[1]);
+  const selectedLabKey = plan.stamps.labs ? candidateStableKey(plan.stamps.labs) : null;
+
+  return {
+    roomName: room.roomName,
+    policy,
+    topK,
+    score: plan.score,
+    selectedPath: [selectedHubKey, selectedPod1Key, selectedPod2Key, ...(selectedLabKey ? [selectedLabKey] : [])],
+    tree: hubCandidates.map((hub, hubIndex) => {
+      const hubState = placeStamp(baseState, hub);
+      const pod1Candidates = generateFastfillerCandidates(features, hubState, hub, topK);
+      const hubKey = candidateStableKey(hub);
+
+      return createTreeNode(`hub-${hubIndex}`, hub, hubIndex, hubKey === selectedHubKey, pod1Candidates.map((pod1, pod1Index) => {
+        const pod1State = placeStamp(hubState, pod1);
+        const pod2Candidates = generateFastfillerCandidates(features, pod1State, hub, topK);
+        const pod1Key = candidateStableKey(pod1);
+
+        return createTreeNode(`hub-${hubIndex}-pod1-${pod1Index}`, pod1, pod1Index, hubKey === selectedHubKey && pod1Key === selectedPod1Key, pod2Candidates.map((pod2, pod2Index) => {
+          const pod2State = placeStamp(pod1State, pod2);
+          const labCandidates = policy === "normal" ? generateLabCandidates(features, pod2State, hub, topK) : [];
+          const pod2Key = candidateStableKey(pod2);
+          const pod2Selected = hubKey === selectedHubKey && pod1Key === selectedPod1Key && pod2Key === selectedPod2Key;
+
+          if (policy === "temple") {
+            return createTreeNode(
+              `hub-${hubIndex}-pod1-${pod1Index}-pod2-${pod2Index}`,
+              pod2,
+              pod2Index,
+              pod2Selected,
+              [],
+              scoreCompleteLayout(features, pod2State, policy, hub, pod1, pod2, null) ?? undefined
+            );
+          }
+
+          return createTreeNode(`hub-${hubIndex}-pod1-${pod1Index}-pod2-${pod2Index}`, pod2, pod2Index, pod2Selected, labCandidates.map((labs, labIndex) => {
+            const labKey = candidateStableKey(labs);
+            const labState = placeStamp(pod2State, labs);
+            return createTreeNode(
+              `hub-${hubIndex}-pod1-${pod1Index}-pod2-${pod2Index}-labs-${labIndex}`,
+              labs,
+              labIndex,
+              pod2Selected && labKey === selectedLabKey,
+              [],
+              scoreCompleteLayout(features, labState, policy, hub, pod1, pod2, labs) ?? undefined
+            );
+          }));
+        }));
+      }));
+    })
+  };
+}
+
+export function createStampPlacementCandidateTreeDebug(
+  room: RoomPlanningRoomData,
+  policy: RoomPlanningPolicy,
+  options: StampSearchOptions = {}
+): StampPlacementInteractiveDebug {
+  const topK = normalizeTopK(options.topK ?? defaultTopK);
+  const features = createRoomFeatures(room);
+  const baseState = createBaseState(features);
+  const hubCandidates = generateHubCandidates(features, baseState, policy, topK);
+
+  return {
+    roomName: room.roomName,
+    policy,
+    topK,
+    score: [],
+    selectedPath: [],
+    tree: hubCandidates.map((hub, hubIndex) => {
+      const hubState = placeStamp(baseState, hub);
+      const pod1Candidates = generateFastfillerCandidates(features, hubState, hub, topK);
+
+      return createTreeNode(`hub-${hubIndex}`, hub, hubIndex, false, pod1Candidates.map((pod1, pod1Index) => {
+        const pod1State = placeStamp(hubState, pod1);
+        const pod2Candidates = generateFastfillerCandidates(features, pod1State, hub, topK);
+
+        return createTreeNode(`hub-${hubIndex}-pod1-${pod1Index}`, pod1, pod1Index, false, pod2Candidates.map((pod2, pod2Index) => {
+          const pod2State = placeStamp(pod1State, pod2);
+          const labCandidates = policy === "normal" ? generateLabCandidates(features, pod2State, hub, topK) : [];
+
+          if (policy === "temple") {
+            return createTreeNode(
+              `hub-${hubIndex}-pod1-${pod1Index}-pod2-${pod2Index}`,
+              pod2,
+              pod2Index,
+              false,
+              [],
+              scoreCompleteLayout(features, pod2State, policy, hub, pod1, pod2, null) ?? undefined
+            );
+          }
+
+          return createTreeNode(`hub-${hubIndex}-pod1-${pod1Index}-pod2-${pod2Index}`, pod2, pod2Index, false, labCandidates.map((labs, labIndex) => {
+            const labState = placeStamp(pod2State, labs);
+            return createTreeNode(
+              `hub-${hubIndex}-pod1-${pod1Index}-pod2-${pod2Index}-labs-${labIndex}`,
+              labs,
+              labIndex,
+              false,
+              [],
+              scoreCompleteLayout(features, labState, policy, hub, pod1, pod2, labs) ?? undefined
+            );
+          }));
+        }));
+      }));
+    })
+  };
+}
+
+export function validateStampPlan(room: RoomPlanningRoomData, plan: RoomStampPlan): string[] {
+  validateTerrain(room.terrain);
+  const errors: string[] = [];
+  const occupied = new Uint8Array(roomArea);
+  for (const object of room.objects) {
+    if (isNaturalBlocker(object)) {
+      occupied[toIndex(object.x, object.y)] = 1;
+    }
+  }
+  const stamps = [plan.stamps.hub, ...plan.stamps.fastfillers, ...(plan.stamps.labs ? [plan.stamps.labs] : [])];
+
+  for (const stamp of stamps) {
+    for (const tile of stamp.blockedTiles) {
+      const coord = fromIndex(tile);
+      if (!isValidIndex(tile) || !isRoadPlanningTerrain(room.terrain, coord.x, coord.y)) {
+        errors.push(`${stamp.label} blocks unbuildable tile ${coord.x},${coord.y}.`);
+      }
+      if (isReservedStampTileForRoom(room, coord.x, coord.y)) {
+        errors.push(`${stamp.label} blocks reserved tile ${coord.x},${coord.y}.`);
+      }
+      if (occupied[tile] !== 0) {
+        errors.push(`${stamp.label} overlaps occupied tile ${coord.x},${coord.y}.`);
+      }
+      occupied[tile] = 1;
+    }
+    for (const constructionTile of getStampConstructionTiles(stamp)) {
+      const coord = fromIndex(constructionTile.tile);
+      if (
+        !isValidIndex(constructionTile.tile)
+        || !isConstructionSiteTerrainAllowed(room.terrain, constructionTile.type, coord.x, coord.y)
+      ) {
+        errors.push(`${stamp.label} ${constructionTile.type} is not buildable at ${coord.x},${coord.y}.`);
+      }
+    }
+  }
+
+  if (plan.stamps.fastfillers.length !== 2) {
+    errors.push("Plan must contain exactly two fastfiller stamps.");
+  }
+
+  if (plan.policy === "normal" && plan.stamps.labs === null) {
+    errors.push("Normal plan must contain a lab stamp.");
+  }
+
+  if (plan.policy === "temple" && plan.stamps.labs !== null) {
+    errors.push("Temple plan must not contain a lab stamp.");
+  }
+
+  return errors;
+}
+
+function searchStampPlacements(room: RoomPlanningRoomData, policy: RoomPlanningPolicy, options: StampSearchOptions): SearchResult {
+  const job = new ResumableRoomStampPlanningJob(room, policy, options);
+  const plan = job.advance(null);
+  if (plan === null) {
+    throw new Error(`No viable ${policy} stamp layout found for room '${room.roomName}'.`);
+  }
+  return {
+    plan,
+    branch: {
+      hub: plan.stamps.hub,
+      pod1: plan.stamps.fastfillers[0],
+      pod2: plan.stamps.fastfillers[1],
+      labs: plan.stamps.labs
+    }
+  };
+}
+
+class ResumableRoomStampPlanningJob implements RoomStampPlanningJob {
+  readonly roomName: string;
+  readonly policy: RoomPlanningPolicy;
+  stage = "stamp:init";
+
+  private readonly features: RoomFeatures;
+  private readonly baseState: PlacementState;
+  private readonly options: StampSearchOptions;
+  private readonly topKs: number[];
+  private readonly cache = createCandidateGenerationCache();
+  private readonly exploredLayouts = new Set<string>();
+  private topKIndex = 0;
+  private search: TopKSearchState | null = null;
+  private done: RoomStampPlan | null = null;
+
+  constructor(room: RoomPlanningRoomData, policy: RoomPlanningPolicy, options: StampSearchOptions) {
+    this.roomName = room.roomName;
+    this.policy = policy;
+    this.options = options;
+    this.features = createRoomFeatures(room);
+    this.baseState = createBaseState(this.features);
+    this.topKs = options.topK === undefined ? [...fallbackTopKs] : [normalizeTopK(options.topK)];
+  }
+
+  advance(budget: PlanningBudget | null = null): RoomStampPlan | null {
+    if (this.done !== null) {
+      return this.done;
+    }
+
+    while (this.topKIndex < this.topKs.length) {
+      this.stage = `stamp:topK-${this.topKs[this.topKIndex]!}`;
+      this.search ??= createTopKSearchState(this.features, this.baseState, this.policy, this.topKs[this.topKIndex]!);
+      const result = advanceStampSearchAtTopK(this.search, this.cache, this.exploredLayouts, this.options.validateCompleteLayout, budget);
+      if (result === "yield") {
+        return null;
+      }
+      if (result !== null) {
+        this.done = result.plan;
+        this.stage = "stamp:complete";
+        return this.done;
+      }
+
+      this.search = null;
+      this.topKIndex += 1;
+    }
+
+    throw new Error(`No viable ${this.policy} stamp layout found for room '${this.roomName}'.`);
+  }
+}
+
+type TopKSearchState = {
+  features: RoomFeatures;
+  baseState: PlacementState;
+  policy: RoomPlanningPolicy;
+  topK: number;
+  hubCandidates: Candidate[];
+  hubIndex: number;
+  pod1Candidates: Candidate[] | null;
+  pod1Index: number;
+  pod2Candidates: Candidate[] | null;
+  pod2Index: number;
+  labCandidates: Array<Candidate | null> | null;
+  labIndex: number;
+  best: SearchResult | null;
+};
+
+function createTopKSearchState(
+  features: RoomFeatures,
+  baseState: PlacementState,
+  policy: RoomPlanningPolicy,
+  topK: number
+): TopKSearchState {
+  return {
+    features,
+    baseState,
+    policy,
+    topK,
+    hubCandidates: generateHubCandidates(features, baseState, policy, topK),
+    hubIndex: 0,
+    pod1Candidates: null,
+    pod1Index: 0,
+    pod2Candidates: null,
+    pod2Index: 0,
+    labCandidates: null,
+    labIndex: 0,
+    best: null
+  };
+}
+
+function advanceStampSearchAtTopK(
+  state: TopKSearchState,
+  cache: CandidateGenerationCache,
+  exploredLayouts: Set<string>,
+  validateCompleteLayout: StampSearchOptions["validateCompleteLayout"],
+  budget: PlanningBudget | null
+): SearchResult | null | "yield" {
+  while (state.hubIndex < state.hubCandidates.length) {
+    if (shouldYield(budget)) return "yield";
+    const hub = state.hubCandidates[state.hubIndex]!;
+    if (state.best !== null && compareScorePrefix(hub.score, state.best.plan.score, hub.score.length) > 0) {
+      break;
+    }
+
+    const hubState = placeStamp(state.baseState, hub);
+    if (state.pod1Candidates === null) {
+      const pod1Candidates = generateFastfillerCandidatesBudgeted(state.features, hubState, hub, state.topK, cache, budget);
+      if (pod1Candidates === null) return "yield";
+      state.pod1Candidates = pod1Candidates;
+      state.pod1Index = 0;
+    }
+
+    while (state.pod1Index < state.pod1Candidates.length) {
+      if (shouldYield(budget)) return "yield";
+      const pod1 = state.pod1Candidates[state.pod1Index]!;
+      const pod1State = placeStamp(hubState, pod1);
+      if (state.pod2Candidates === null) {
+        const pod2Candidates = generateFastfillerCandidatesBudgeted(state.features, pod1State, hub, state.topK, cache, budget);
+        if (pod2Candidates === null) return "yield";
+        state.pod2Candidates = pod2Candidates;
+        state.pod2Index = 0;
+      }
+
+      while (state.pod2Index < state.pod2Candidates.length) {
+        if (shouldYield(budget)) return "yield";
+        const pod2 = state.pod2Candidates[state.pod2Index]!;
+        const pod2State = placeStamp(pod1State, pod2);
+        if (state.labCandidates === null) {
+          if (state.policy === "normal") {
+            const labCandidates = generateLabCandidatesBudgeted(state.features, pod2State, hub, state.topK, cache, budget);
+            if (labCandidates === null) return "yield";
+            state.labCandidates = labCandidates;
+          } else {
+            state.labCandidates = [null];
+          }
+          state.labIndex = 0;
+        }
+
+        while (state.labIndex < state.labCandidates.length) {
+          if (shouldYield(budget)) return "yield";
+          const labs = state.labCandidates[state.labIndex]!;
+          state.labIndex += 1;
+          const key = layoutSearchKey(hub, pod1, pod2, labs);
+          if (exploredLayouts.has(key)) {
+            continue;
+          }
+          exploredLayouts.add(key);
+
+          const finalState = labs === null ? pod2State : placeStamp(pod2State, labs);
+          const score = scoreCompleteLayout(state.features, finalState, state.policy, hub, pod1, pod2, labs);
+          if (score === null) {
+            continue;
+          }
+          const plan: RoomStampPlan = {
+            roomName: state.features.roomName,
+            policy: state.policy,
+            topK: state.topK,
+            score,
+            stamps: {
+              hub,
+              fastfillers: [pod1, pod2],
+              labs
+            }
+          };
+          const candidate: SearchResult = {
+            plan,
+            branch: { hub, pod1, pod2, labs }
+          };
+          const isBestCandidate = state.best === null || compareScore(candidate.plan.score, state.best.plan.score) < 0 || (
+            compareScore(candidate.plan.score, state.best.plan.score) === 0
+            && layoutKey(candidate.plan).localeCompare(layoutKey(state.best.plan)) < 0
+          );
+          if (!isBestCandidate) {
+            continue;
+          }
+          if (validateCompleteLayout && !validateCompleteLayout(plan)) {
+            continue;
+          }
+          state.best = candidate;
+        }
+
+        state.labCandidates = null;
+        state.pod2Index += 1;
+      }
+
+      state.pod2Candidates = null;
+      state.pod1Index += 1;
+    }
+
+    state.pod1Candidates = null;
+    state.hubIndex += 1;
+  }
+
+  return state.best;
+}
+
+function generateHubCandidates(features: RoomFeatures, state: PlacementState, policy: RoomPlanningPolicy, topK: number): Candidate[] {
+  const projectedCandidates = policy === "temple"
+    ? features.projectedTempleHubCandidates
+    : features.projectedNormalHubCandidates;
+  const candidates: Candidate[] = [];
+
+  for (const candidate of projectedCandidates) {
+    if (!fitsStamp(state, candidate)) {
+      continue;
+    }
+
+    const center = candidate.anchors.hubCenter;
+    if (!center) {
+      continue;
+    }
+
+    if (range(center, features.controller) <= 4 || features.sources.some((source) => range(center, source) <= 4)) {
+      continue;
+    }
+
+    if (policy === "temple" && !satisfiesTempleHubConstraints(features, state, candidate)) {
+      continue;
+    }
+
+    if (!hasOpenNeighborAfterPlacement(features, state, candidate, getHubSpawnAnchor(candidate))) {
+      continue;
+    }
+
+    candidate.score = policy === "temple"
+      ? scoreTempleHub(features, candidate)
+      : scoreNormalHubPreliminary(features, candidate);
+    candidates.push(candidate);
+  }
+
+  if (policy === "normal") {
+    return refineNormalHubCandidates(features, candidates, topK);
+  }
+
+  return topCandidates(candidates, topK);
+}
+
+function generateFastfillerCandidates(
+  features: RoomFeatures,
+  state: PlacementState,
+  hub: StampPlacement,
+  topK: number,
+  cache: CandidateGenerationCache | null = null
+): Candidate[] {
+  const cacheKey = placementStateKey(state);
+  const cached = cache?.fastfillers.get(cacheKey);
+  const candidateSet = cached ?? createFastfillerCandidateSet(features, state, hub);
+  if (cache && !cached) {
+    cache.fastfillers.set(cacheKey, candidateSet);
+  }
+  expandFastfillerCandidateSet(features, state, candidateSet, hub, topK);
+  return topCandidates(getExactCandidatesForTopK(candidateSet, topK), topK);
+}
+
+function generateFastfillerCandidatesBudgeted(
+  features: RoomFeatures,
+  state: PlacementState,
+  hub: StampPlacement,
+  topK: number,
+  cache: CandidateGenerationCache,
+  budget: PlanningBudget | null
+): Candidate[] | null {
+  const cacheKey = placementStateKey(state);
+  const cached = cache.fastfillers.get(cacheKey);
+  const candidateSet = cached ?? createFastfillerCandidateSet(features, state, hub);
+  if (!cached) {
+    cache.fastfillers.set(cacheKey, candidateSet);
+  }
+  if (!expandFastfillerCandidateSetBudgeted(features, state, candidateSet, hub, topK, budget)) {
+    return null;
+  }
+  return topCandidates(getExactCandidatesForTopK(candidateSet, topK), topK);
+}
+
+function createFastfillerCandidateSet(features: RoomFeatures, state: PlacementState, hub: StampPlacement): FastfillerCandidateSet {
+  const paths = createPathContext(features, state, hub);
+  if (paths.storageDistanceMap === null) {
+    return {
+      preliminary: [],
+      exactCandidates: [],
+      evaluated: 0,
+      paths
+    };
+  }
+
+  const preliminary: Candidate[] = [];
+
+  for (const candidate of features.projectedFastfillerCandidates) {
+    if (!fitsStamp(state, candidate)) {
+      continue;
+    }
+
+    if (!hasOpenNeighborAfterPlacement(features, state, candidate, candidate.anchor)) {
+      continue;
+    }
+
+    const metrics = scoreFastfillerWithPaths(paths, candidate);
+    if (metrics === null) {
+      continue;
+    }
+
+    const { storageDistance, sourceDetours } = metrics;
+    const bestSourceDetour = Math.min(sourceDetours[0], sourceDetours[1]);
+    if (bestSourceDetour === dijkstraUnreachable) {
+      continue;
+    }
+
+    candidate.storageDistance = storageDistance;
+    candidate.sourceDetours = sourceDetours;
+    candidate.score = [-storageDistance, -bestSourceDetour, -candidate.anchor.y, -candidate.anchor.x];
+    preliminary.push(candidate);
+  }
+
+  preliminary.sort(compareCandidates);
+  return {
+    preliminary,
+    exactCandidates: [],
+    evaluated: 0,
+    paths
+  };
+}
+
+function expandFastfillerCandidateSet(
+  features: RoomFeatures,
+  state: PlacementState,
+  candidateSet: FastfillerCandidateSet,
+  hub: StampPlacement,
+  topK: number
+): void {
+  for (const limit of candidateEvaluationLimits(candidateSet, topK)) {
+    for (; candidateSet.evaluated < limit; candidateSet.evaluated += 1) {
+      const candidate = candidateSet.preliminary[candidateSet.evaluated]!;
+      const metrics = scoreFastfillerCandidate(candidateSet.paths, candidate);
+      if (metrics === null) {
+        continue;
+      }
+
+      const { storageDistance, sourceDetours } = metrics;
+      const bestSourceDetour = Math.min(sourceDetours[0], sourceDetours[1]);
+      if (bestSourceDetour === dijkstraUnreachable) {
+        continue;
+      }
+
+      candidate.storageDistance = storageDistance;
+      candidate.sourceDetours = sourceDetours;
+      candidate.score = [-storageDistance, -bestSourceDetour, -candidate.anchor.y, -candidate.anchor.x];
+      candidateSet.exactCandidates.push({
+        preliminaryIndex: candidateSet.evaluated,
+        candidate
+      });
+    }
+  }
+}
+
+function expandFastfillerCandidateSetBudgeted(
+  features: RoomFeatures,
+  state: PlacementState,
+  candidateSet: FastfillerCandidateSet,
+  hub: StampPlacement,
+  topK: number,
+  budget: PlanningBudget | null
+): boolean {
+  void features;
+  void state;
+  void hub;
+  for (const limit of candidateEvaluationLimits(candidateSet, topK)) {
+    for (; candidateSet.evaluated < limit; candidateSet.evaluated += 1) {
+      if (shouldYield(budget)) {
+        return false;
+      }
+      const candidate = candidateSet.preliminary[candidateSet.evaluated]!;
+      const metrics = scoreFastfillerCandidate(candidateSet.paths, candidate);
+      if (metrics === null) {
+        continue;
+      }
+
+      const { storageDistance, sourceDetours } = metrics;
+      const bestSourceDetour = Math.min(sourceDetours[0], sourceDetours[1]);
+      if (bestSourceDetour === dijkstraUnreachable) {
+        continue;
+      }
+
+      candidate.storageDistance = storageDistance;
+      candidate.sourceDetours = sourceDetours;
+      candidate.score = [-storageDistance, -bestSourceDetour, -candidate.anchor.y, -candidate.anchor.x];
+      candidateSet.exactCandidates.push({
+        preliminaryIndex: candidateSet.evaluated,
+        candidate
+      });
+    }
+  }
+  return true;
+}
+
+function generateLabCandidates(
+  features: RoomFeatures,
+  state: PlacementState,
+  hub: StampPlacement,
+  topK: number,
+  cache: CandidateGenerationCache | null = null
+): Candidate[] {
+  const cacheKey = placementStateKey(state);
+  const cached = cache?.labs.get(cacheKey);
+  const candidateSet = cached ?? createLabCandidateSet(features, state, hub);
+  if (cache && !cached) {
+    cache.labs.set(cacheKey, candidateSet);
+  }
+  expandLabCandidateSet(features, state, candidateSet, topK);
+  return topCandidates(getExactCandidatesForTopK(candidateSet, topK), topK);
+}
+
+function generateLabCandidatesBudgeted(
+  features: RoomFeatures,
+  state: PlacementState,
+  hub: StampPlacement,
+  topK: number,
+  cache: CandidateGenerationCache,
+  budget: PlanningBudget | null
+): Candidate[] | null {
+  const cacheKey = placementStateKey(state);
+  const cached = cache.labs.get(cacheKey);
+  const candidateSet = cached ?? createLabCandidateSet(features, state, hub);
+  if (!cached) {
+    cache.labs.set(cacheKey, candidateSet);
+  }
+  if (!expandLabCandidateSetBudgeted(features, state, candidateSet, topK, budget)) {
+    return null;
+  }
+  return topCandidates(getExactCandidatesForTopK(candidateSet, topK), topK);
+}
+
+function createLabCandidateSet(features: RoomFeatures, state: PlacementState, hub: StampPlacement): LabCandidateSet {
+  const paths = createPathContext(features, state, hub);
+  if (paths.storageDistanceMap === null || paths.terminalDistanceMap === null) {
+    return {
+      preliminary: [],
+      exactCandidates: [],
+      evaluated: 0,
+      paths
+    };
+  }
+
+  const preliminary: Candidate[] = [];
+
+  for (const candidate of features.projectedLabCandidates) {
+    if (!fitsStamp(state, candidate)) {
+      continue;
+    }
+
+    const entrance = candidate.anchors.entrance ?? candidate.anchor;
+    const labScore = createDirectLabScore(paths, entrance);
+    if (labScore === null) {
+      continue;
+    }
+
+    assignLabScore(candidate, labScore);
+    preliminary.push(candidate);
+  }
+
+  preliminary.sort(compareCandidates);
+  return {
+    preliminary,
+    exactCandidates: [],
+    evaluated: 0,
+    paths
+  };
+}
+
+function expandLabCandidateSet(
+  features: RoomFeatures,
+  state: PlacementState,
+  candidateSet: LabCandidateSet,
+  topK: number
+): void {
+  for (const limit of candidateEvaluationLimits(candidateSet, topK)) {
+    for (; candidateSet.evaluated < limit; candidateSet.evaluated += 1) {
+      const candidate = candidateSet.preliminary[candidateSet.evaluated]!;
+      const candidateState = placeStamp(state, candidate);
+      const labScore = scoreLabCandidate(features, candidateState, candidateSet.paths, candidate);
+      if (labScore === null) {
+        continue;
+      }
+
+      assignLabScore(candidate, labScore);
+      candidateSet.exactCandidates.push({
+        preliminaryIndex: candidateSet.evaluated,
+        candidate
+      });
+    }
+  }
+}
+
+function expandLabCandidateSetBudgeted(
+  features: RoomFeatures,
+  state: PlacementState,
+  candidateSet: LabCandidateSet,
+  topK: number,
+  budget: PlanningBudget | null
+): boolean {
+  for (const limit of candidateEvaluationLimits(candidateSet, topK)) {
+    for (; candidateSet.evaluated < limit; candidateSet.evaluated += 1) {
+      if (shouldYield(budget)) {
+        return false;
+      }
+      const candidate = candidateSet.preliminary[candidateSet.evaluated]!;
+      const candidateState = placeStamp(state, candidate);
+      const labScore = scoreLabCandidate(features, candidateState, candidateSet.paths, candidate);
+      if (labScore === null) {
+        continue;
+      }
+
+      assignLabScore(candidate, labScore);
+      candidateSet.exactCandidates.push({
+        preliminaryIndex: candidateSet.evaluated,
+        candidate
+      });
+    }
+  }
+  return true;
+}
+
+function shouldYield(budget: PlanningBudget | null): boolean {
+  return budget?.shouldYield() ?? false;
+}
+
+function* candidateEvaluationLimits(candidateSet: ExpandableCandidateSet, topK: number): Iterable<number> {
+  let limit = Math.min(candidateSet.preliminary.length, topK * exactCandidateWindowMultiplier);
+
+  while (candidateSet.evaluated < candidateSet.preliminary.length) {
+    if (candidateSet.evaluated < limit) {
+      yield limit;
+    }
+    if (countExactCandidatesBefore(candidateSet, limit) >= topK || limit === candidateSet.preliminary.length) {
+      break;
+    }
+    limit = Math.min(candidateSet.preliminary.length, Math.max(limit + 1, limit * 2));
+  }
+}
+
+function getExactCandidatesForTopK(candidateSet: ExpandableCandidateSet, topK: number): Candidate[] {
+  let limit = Math.min(candidateSet.preliminary.length, topK * exactCandidateWindowMultiplier);
+
+  while (true) {
+    if (countExactCandidatesBefore(candidateSet, limit) >= topK || limit === candidateSet.preliminary.length) {
+      return candidateSet.exactCandidates
+        .filter((entry) => entry.preliminaryIndex < limit)
+        .map((entry) => entry.candidate);
+    }
+    limit = Math.min(candidateSet.preliminary.length, Math.max(limit + 1, limit * 2));
+  }
+}
+
+function countExactCandidatesBefore(candidateSet: ExpandableCandidateSet, limit: number): number {
+  let count = 0;
+  for (const entry of candidateSet.exactCandidates) {
+    if (entry.preliminaryIndex < limit) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function createCandidateGenerationCache(): CandidateGenerationCache {
+  return {
+    fastfillers: new Map(),
+    labs: new Map()
+  };
+}
+
+function scoreCompleteLayout(
+  features: RoomFeatures,
+  finalState: PlacementState,
+  policy: RoomPlanningPolicy,
+  hub: Candidate,
+  pod1: Candidate,
+  pod2: Candidate,
+  labs: Candidate | null
+): number[] | null {
+  const paths = createPathContext(features, finalState, hub);
+  if (!hasHubSpawnStorageAccess(features, finalState, hub, paths.storageDistanceMap)) {
+    return null;
+  }
+  const pod1Score = scoreFastfillerWithPaths(paths, pod1);
+  const pod2Score = scoreFastfillerWithPaths(paths, pod2);
+  const storageDistance = (pod1Score?.storageDistance ?? dijkstraUnreachable) + (pod2Score?.storageDistance ?? dijkstraUnreachable);
+  const sourceDetour = scorePodSourceAssignment(
+    pod1Score?.sourceDetours ?? [dijkstraUnreachable, dijkstraUnreachable],
+    pod2Score?.sourceDetours ?? [dijkstraUnreachable, dijkstraUnreachable]
+  );
+  const labScore = policy === "normal" && labs !== null
+    ? scoreLabAccess(features, finalState, paths.storageDistanceMap, paths.terminalDistanceMap, labs)
+    : null;
+  const labDistance = policy === "normal" && labs !== null
+    ? labScore?.totalDistance ?? dijkstraUnreachable
+    : 0;
+  if (policy === "normal" && !hasTerminalMineralAccess(features, finalState, hub)) {
+    return null;
+  }
+
+  return [
+    ...hub.score,
+    -storageDistance,
+    -sourceDetour,
+    -labDistance,
+    -(hub.blockedTiles.length + pod1.blockedTiles.length + pod2.blockedTiles.length + (labs?.blockedTiles.length ?? 0))
+  ];
+}
+
+function hasTerminalMineralAccess(features: RoomFeatures, state: PlacementState, hub: StampPlacement): boolean {
+  const terminal = hub.anchors.terminal ?? null;
+  if (features.mineral === null || terminal === null) {
+    return false;
+  }
+
+  const terminalGoals = getPathGoals(features, state, terminal, null);
+  const mineralGoals = getPathGoals(features, state, features.mineral, null);
+  if (terminalGoals.length === 0 || mineralGoals.length === 0) {
+    return false;
+  }
+
+  const terminalDistanceMap = createDijkstraMap(features.terrain, terminalGoals, {
+    costMatrix: new GridCostMatrix(state.pathBlocked)
+  });
+  return minDistance(terminalDistanceMap, mineralGoals) !== dijkstraUnreachable;
+}
+
+function scoreFastfillerCandidate(previousPaths: PathContext, candidate: Candidate): FastfillerScore | null {
+  const storageDistance = scoreFastfillerStorageDistance(previousPaths, candidate);
+  if (storageDistance === null) {
+    return null;
+  }
+
+  const sourceDetours = scoreFastfillerSourceDetours(previousPaths, candidate, storageDistance);
+  return {
+    storageDistance,
+    sourceDetours
+  };
+}
+
+function scoreFastfillerWithPaths(paths: PathContext, candidate: Candidate): FastfillerScore | null {
+  if (paths.storageDistanceMap === null) {
+    return null;
+  }
+
+  const storageDistance = paths.storageDistanceMap.get(candidate.anchor.x, candidate.anchor.y);
+  if (storageDistance === dijkstraUnreachable) {
+    return null;
+  }
+
+  const sourceDetours = paths.sourceDistanceMaps.map((sourceMap, index) => {
+    const storageToSourceDistance = paths.storageToSourceDistances[index]!;
+    if (sourceMap === null || storageToSourceDistance === dijkstraUnreachable) {
+      return dijkstraUnreachable;
+    }
+
+    const sourceDistance = sourceMap.get(candidate.anchor.x, candidate.anchor.y);
+    if (sourceDistance === dijkstraUnreachable) {
+      return dijkstraUnreachable;
+    }
+
+    return storageDistance + sourceDistance - storageToSourceDistance;
+  }) as [number, number];
+
+  return {
+    storageDistance,
+    sourceDetours
+  };
+}
+
+function scoreFastfillerStorageDistance(paths: PathContext, candidate: Candidate): number | null {
+  if (paths.storageDistanceMap === null) {
+    return null;
+  }
+
+  const storageDistance = getRepairedDijkstraDistance(
+    paths.storageDistanceMap,
+    getAddedPathBlockedTiles(candidate),
+    [toIndex(candidate.anchor.x, candidate.anchor.y)],
+    paths.repairScratch
+  ).distance;
+  return storageDistance === dijkstraUnreachable ? null : storageDistance;
+}
+
+function scoreFastfillerSourceDetours(paths: PathContext, candidate: Candidate, storageDistance: number): [number, number] {
+  return paths.sourceDistanceMaps.map((sourceMap, index) => {
+    const storageToSourceDistance = paths.storageToSourceDistances[index]!;
+    if (sourceMap === null || storageToSourceDistance === dijkstraUnreachable) {
+      return dijkstraUnreachable;
+    }
+
+    const sourceDistance = sourceMap.get(candidate.anchor.x, candidate.anchor.y);
+    if (sourceDistance === dijkstraUnreachable) {
+      return dijkstraUnreachable;
+    }
+
+    return storageDistance + sourceDistance - storageToSourceDistance;
+  }) as [number, number];
+}
+
+function scorePodSourceAssignment(first: [number, number], second: [number, number]): number {
+  return Math.min(first[0] + second[1], first[1] + second[0]);
+}
+
+function scoreLabCandidate(features: RoomFeatures, state: PlacementState, paths: PathContext, labs: Candidate): LabScore | null {
+  if (paths.storageDistanceMap === null || paths.terminalDistanceMap === null) {
+    return null;
+  }
+
+  const entrance = labs.anchors.entrance ?? labs.anchor;
+  const accessGoals = getDirectPathGoals(features, state, entrance, features.reservedPathMasks.default);
+  if (accessGoals.length === 0) {
+    return null;
+  }
+
+  const addedBlockedTiles = getAddedPathBlockedTiles(labs);
+  const accessGoalTiles = accessGoals.map((goal) => toIndex(goal.x, goal.y));
+  const storageDistance = getRepairedDijkstraDistance(paths.storageDistanceMap, addedBlockedTiles, accessGoalTiles, paths.repairScratch).distance;
+  const terminalDistance = getRepairedDijkstraDistance(paths.terminalDistanceMap, addedBlockedTiles, accessGoalTiles, paths.repairScratch).distance;
+  if (storageDistance === dijkstraUnreachable || terminalDistance === dijkstraUnreachable) {
+    return null;
+  }
+
+  return {
+    storageDistance,
+    terminalDistance,
+    totalDistance: storageDistance + terminalDistance
+  };
+}
+
+function createDirectLabScore(paths: PathContext, entrance: RoomStampAnchor): LabScore | null {
+  if (paths.storageDistanceMap === null || paths.terminalDistanceMap === null) {
+    return null;
+  }
+
+  const storageDistance = paths.storageDistanceMap.get(entrance.x, entrance.y);
+  const terminalDistance = paths.terminalDistanceMap.get(entrance.x, entrance.y);
+  if (storageDistance === dijkstraUnreachable || terminalDistance === dijkstraUnreachable) {
+    return null;
+  }
+
+  return {
+    storageDistance,
+    terminalDistance,
+    totalDistance: storageDistance + terminalDistance
+  };
+}
+
+function scoreLabAccess(
+  features: RoomFeatures,
+  state: PlacementState,
+  storageDistanceMap: DijkstraMap | null,
+  terminalDistanceMap: DijkstraMap | null,
+  labs: Candidate
+): LabScore | null {
+  if (storageDistanceMap === null || terminalDistanceMap === null) {
+    return null;
+  }
+
+  const entrance = labs.anchors.entrance ?? labs.anchor;
+  const accessGoals = getDirectPathGoals(features, state, entrance, features.reservedPathMasks.default);
+  if (accessGoals.length === 0) {
+    return null;
+  }
+
+  const storageDistance = minDistance(storageDistanceMap, accessGoals);
+  const terminalDistance = minDistance(terminalDistanceMap, accessGoals);
+  if (storageDistance === dijkstraUnreachable || terminalDistance === dijkstraUnreachable) {
+    return null;
+  }
+
+  return {
+    storageDistance,
+    terminalDistance,
+    totalDistance: storageDistance + terminalDistance
+  };
+}
+
+function assignLabScore(candidate: Candidate, labScore: LabScore): void {
+  candidate.labDistance = labScore.totalDistance;
+  candidate.labStorageDistance = labScore.storageDistance;
+  candidate.labTerminalDistance = labScore.terminalDistance;
+  candidate.score = [
+    -labScore.totalDistance,
+    -labScore.terminalDistance,
+    -labScore.storageDistance,
+    -candidate.anchor.y,
+    -candidate.anchor.x
+  ];
+}
+
+function refineNormalHubCandidates(features: RoomFeatures, candidates: Candidate[], topK: number): Candidate[] {
+  const preliminaryLimit = Math.min(candidates.length, topK);
+  const preliminaryTop = [...candidates].sort(compareCandidates).slice(0, preliminaryLimit);
+  for (const candidate of preliminaryTop) {
+    const center = candidate.anchors.hubCenter ?? candidate.anchor;
+    candidate.score = scoreNormalHub(features, candidate, estimateProvisionalDefenseCutSize(features, center));
+  }
+
+  return topCandidates(preliminaryTop, topK);
+}
+
+function scoreNormalHubPreliminary(features: RoomFeatures, candidate: StampPlacement): number[] {
+  const center = candidate.anchors.hubCenter ?? candidate.anchor;
+  const exitDistance = features.exitDistanceMap.get(center.x, center.y);
+  const clearance = features.terrainDistanceTransform.get(center.x, center.y);
+  return [
+    exitDistance === dijkstraUnreachable ? 0 : exitDistance,
+    clearance,
+    -candidate.anchor.y,
+    -candidate.anchor.x
+  ];
+}
+
+function scoreNormalHub(features: RoomFeatures, candidate: StampPlacement, provisionalCutSize: number): number[] {
+  const preliminary = scoreNormalHubPreliminary(features, candidate);
+  return [
+    preliminary[0]!,
+    preliminary[1]!,
+    -provisionalCutSize,
+    preliminary[2]!,
+    preliminary[3]!
+  ];
+}
+
+function scoreTempleHub(features: RoomFeatures, candidate: StampPlacement): number[] {
+  const center = candidate.anchors.hubCenter ?? candidate.anchor;
+  const upgradingMask = createUpgradingMask(features);
+  const connectedSeeds: Coord[] = [];
+  let rangeTwoUpgradingTiles = 0;
+
+  for (let y = Math.max(1, center.y - 2); y <= Math.min(roomSize - 2, center.y + 2); y += 1) {
+    for (let x = Math.max(1, center.x - 2); x <= Math.min(roomSize - 2, center.x + 2); x += 1) {
+      if (range({ x, y }, center) > 2 || upgradingMask[toIndex(x, y)] === 0) {
+        continue;
+      }
+      rangeTwoUpgradingTiles += 1;
+      connectedSeeds.push({ x, y });
+    }
+  }
+
+  const connectedSize = connectedSeeds.length === 0 ? 0 : countConnectedTiles(upgradingMask, connectedSeeds);
+  return [
+    rangeTwoUpgradingTiles,
+    connectedSize,
+    -candidate.anchor.y,
+    -candidate.anchor.x
+  ];
+}
+
+function satisfiesTempleHubConstraints(features: RoomFeatures, state: PlacementState, candidate: StampPlacement): boolean {
+  const center = candidate.anchors.hubCenter ?? candidate.anchor;
+  const storage = candidate.anchors.storage ?? candidate.anchor;
+  const terminal = candidate.anchors.terminal;
+  if (!terminal) {
+    return false;
+  }
+
+  if (range(center, features.controller) !== 5) {
+    return false;
+  }
+
+  if (!isAdjacentToControllerRangeTile(features, storage, 3) || !isAdjacentToControllerRangeTile(features, terminal, 3)) {
+    return false;
+  }
+
+  const nextState = placeStamp(state, candidate);
+  const exitMap = createDijkstraMap(features.terrain, features.exits, {
+    costMatrix: new GridCostMatrix(nextState.pathBlocked, features.reservedPathMasks.edgeOrigin)
+  });
+
+  return hasFiniteAccessDistance(features, nextState, exitMap, storage)
+    && hasFiniteAccessDistance(features, nextState, exitMap, terminal);
+}
+
+function createPathContext(features: RoomFeatures, state: PlacementState, hub: StampPlacement): PathContext {
+  const storage = hub.anchors.storage ?? hub.anchor;
+  const storageGoals = getPathGoals(features, state, storage, features.reservedPathMasks.default);
+  const sourceGoals = features.sources.map((source, index) => (
+    getPathGoals(features, state, source, features.reservedPathMasks.sourceOrigins[index]!)
+  )) as [Coord[], Coord[]];
+  const sourceCostMatrices = features.sources.map((_, index) => (
+    new GridCostMatrix(state.pathBlocked, features.reservedPathMasks.sourceOrigins[index]!)
+  )) as [GridCostMatrix, GridCostMatrix];
+  const storageDistanceMap = createStorageDistanceMap(features, state, hub);
+  const terminalDistanceMap = createTerminalDistanceMap(features, state, hub);
+  const sourceDistanceMaps = sourceGoals.map((goals, index) => (
+    goals.length === 0 ? null : createDijkstraMap(features.terrain, goals, { costMatrix: sourceCostMatrices[index]! })
+  )) as [DijkstraMap | null, DijkstraMap | null];
+
+  return {
+    storageDistanceMap,
+    terminalDistanceMap,
+    sourceDistanceMaps,
+    storageToSourceDistances: sourceDistanceMaps.map((sourceDistanceMap) => {
+      if (sourceDistanceMap === null || storageGoals.length === 0) {
+        return dijkstraUnreachable;
+      }
+
+      return minDistance(sourceDistanceMap, storageGoals);
+    }) as [number, number],
+    repairScratch: createRepairableDijkstraScratch()
+  };
+}
+
+function createStorageDistanceMap(features: RoomFeatures, state: PlacementState, hub: StampPlacement): RepairableDijkstraMap | null {
+  const storage = hub.anchors.storage ?? hub.anchor;
+  const storageGoals = getPathGoals(features, state, storage, features.reservedPathMasks.default);
+  return storageGoals.length === 0 ? null : createRepairableDijkstraMap(features.terrain, storageGoals, {
+    costMatrix: new GridCostMatrix(state.pathBlocked, features.reservedPathMasks.default)
+  });
+}
+
+function createTerminalDistanceMap(features: RoomFeatures, state: PlacementState, hub: StampPlacement): RepairableDijkstraMap | null {
+  const terminal = hub.anchors.terminal ?? null;
+  if (terminal === null) {
+    return null;
+  }
+
+  const terminalGoals = getPathGoals(features, state, terminal, features.reservedPathMasks.default);
+  return terminalGoals.length === 0 ? null : createRepairableDijkstraMap(features.terrain, terminalGoals, {
+    costMatrix: new GridCostMatrix(state.pathBlocked, features.reservedPathMasks.default)
+  });
+}
+
+function createRoomFeatures(room: RoomPlanningRoomData): RoomFeatures {
+  validateTerrain(room.terrain);
+  const controller = room.objects.find((object) => object.type === "controller");
+  if (!controller) {
+    throw new Error(`Room '${room.roomName}' is missing a controller.`);
+  }
+
+  const sources = room.objects.filter((object) => object.type === "source").sort(compareObjects);
+  if (sources.length !== 2) {
+    throw new Error(`Room '${room.roomName}' must have exactly two sources for stamp planning.`);
+  }
+
+  const baseOccupied = new Uint8Array(roomArea);
+  const basePathBlocked = new Uint8Array(roomArea);
+  for (const object of room.objects) {
+    if (isNaturalBlocker(object)) {
+      const index = toIndex(object.x, object.y);
+      baseOccupied[index] = 1;
+      basePathBlocked[index] = 1;
+    }
+  }
+
+  const exits = findExitTiles(room.terrain);
+  if (exits.length === 0) {
+    throw new Error(`Room '${room.roomName}' has no walkable exits.`);
+  }
+  const sourcePair: [RoomPlanningObject, RoomPlanningObject] = [sources[0]!, sources[1]!];
+  const reservedPathMasks = createReservedPathMasks(controller, sourcePair);
+
+  return {
+    roomName: room.roomName,
+    terrain: room.terrain,
+    controller,
+    sources: sourcePair,
+    mineral: room.objects.find((object) => object.type === "mineral") ?? null,
+    exits,
+    baseOccupied,
+    basePathBlocked,
+    reservedPathMasks,
+    terrainDistanceTransform: createTerrainDistanceTransform(room.terrain),
+    exitDistanceMap: createDijkstraMap(room.terrain, exits, {
+      costMatrix: new GridCostMatrix(basePathBlocked, reservedPathMasks.edgeOrigin)
+    }),
+    projectedNormalHubCandidates: createProjectedCandidates(room.terrain, controller, sourcePair, normalHubTemplate),
+    projectedTempleHubCandidates: createProjectedCandidates(room.terrain, controller, sourcePair, templeHubTemplate),
+    projectedFastfillerCandidates: createProjectedCandidates(room.terrain, controller, sourcePair, fastfillerTemplate),
+    projectedLabCandidates: createProjectedCandidates(room.terrain, controller, sourcePair, labTemplate)
+  };
+}
+
+function createBaseState(features: RoomFeatures): PlacementState {
+  return {
+    occupied: new Uint8Array(features.baseOccupied),
+    pathBlocked: new Uint8Array(features.basePathBlocked),
+    placements: []
+  };
+}
+
+function placeStamp(state: PlacementState, placement: StampPlacement): PlacementState {
+  const occupied = new Uint8Array(state.occupied);
+  const pathBlocked = new Uint8Array(state.pathBlocked);
+
+  for (const tile of placement.blockedTiles) {
+    occupied[tile] = 1;
+  }
+
+  for (const tile of getStampPathBlockedTiles(placement)) {
+    pathBlocked[tile] = 1;
+  }
+
+  if (placement.kind === "fastfiller") {
+    pathBlocked[toIndex(placement.anchor.x, placement.anchor.y)] = 0;
+  }
+
+  return {
+    occupied,
+    pathBlocked,
+    placements: [...state.placements, placement]
+  };
+}
+
+function fitsStamp(state: PlacementState, placement: StampPlacement): boolean {
+  for (const tile of placement.blockedTiles) {
+    if (state.occupied[tile] !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function projectStamp(template: StampTemplate, anchor: Coord, rotation: StampRotation, score: number[]): Candidate {
+  const blockedTiles = projectOffsets(template.blockedOffsets, anchor, rotation);
+  const pathBlockedTiles = template.pathBlockedOffsets
+    ? projectOffsets(template.pathBlockedOffsets, anchor, rotation)
+    : undefined;
+  const roadTiles = template.roadOffsets ? projectOffsets(template.roadOffsets, anchor, rotation) : undefined;
+
+  const anchors: Record<string, RoomStampAnchor> = {};
+  for (const [name, offset] of Object.entries(template.anchors)) {
+    const rotated = rotateOffset(offset, rotation);
+    anchors[name] = {
+      x: anchor.x + rotated.x,
+      y: anchor.y + rotated.y
+    };
+  }
+
+  return {
+    kind: template.kind,
+    label: `${template.label}@${anchor.x},${anchor.y},r${rotation}`,
+    rotation,
+    anchor,
+    anchors,
+    blockedTiles,
+    pathBlockedTiles,
+    roadTiles,
+    score
+  };
+}
+
+function createProjectedCandidates(
+  terrain: string,
+  controller: RoomPlanningObject,
+  sources: [RoomPlanningObject, RoomPlanningObject],
+  template: StampTemplate
+): Candidate[] {
+  const candidates: Candidate[] = [];
+  for (let y = 1; y < roomSize - 1; y += 1) {
+    for (let x = 1; x < roomSize - 1; x += 1) {
+      for (const rotation of template.rotations) {
+        const candidate = projectStamp(template, { x, y }, rotation, []);
+        if (fitsStampStatic(terrain, controller, sources, candidate)) {
+          candidates.push(candidate);
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
+function fitsStampStatic(
+  terrain: string,
+  controller: RoomPlanningObject,
+  sources: [RoomPlanningObject, RoomPlanningObject],
+  placement: StampPlacement
+): boolean {
+  for (const tile of placement.blockedTiles) {
+    const { x, y } = fromIndex(tile);
+    if (!isValidIndex(tile) || !isRoadPlanningTerrain(terrain, x, y) || isReservedStampTile(controller, sources, x, y)) {
+      return false;
+    }
+  }
+  for (const constructionTile of getStampConstructionTiles(placement)) {
+    const { x, y } = fromIndex(constructionTile.tile);
+    if (
+      !isValidIndex(constructionTile.tile)
+      || !isConstructionSiteTerrainAllowed(terrain, constructionTile.type, x, y)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function projectOffsets(offsets: Coord[], anchor: Coord, rotation: StampRotation): number[] {
+  const tiles: number[] = [];
+  const seenTiles = new Set<number>();
+
+  for (const offset of offsets) {
+    const rotated = rotateOffset(offset, rotation);
+    const x = anchor.x + rotated.x;
+    const y = anchor.y + rotated.y;
+    if (!isInRoom(x, y)) {
+      tiles.push(-1);
+      continue;
+    }
+
+    const tile = toIndex(x, y);
+    if (!seenTiles.has(tile)) {
+      seenTiles.add(tile);
+      tiles.push(tile);
+    }
+  }
+
+  return tiles;
+}
+
+function getHubSpawnAnchor(hub: StampPlacement): RoomStampAnchor {
+  const offset = rotateOffset({ x: 1, y: 2 }, hub.rotation);
+  return {
+    x: hub.anchor.x + offset.x,
+    y: hub.anchor.y + offset.y
+  };
+}
+
+function rotateOffset(offset: Coord, rotation: StampRotation): Coord {
+  switch (rotation) {
+    case 0:
+      return offset;
+    case 90:
+      return { x: -offset.y, y: offset.x };
+    case 180:
+      return { x: -offset.x, y: -offset.y };
+    case 270:
+      return { x: offset.y, y: -offset.x };
+  }
+}
+
+function topCandidates<T extends Candidate>(candidates: T[], topK: number): T[] {
+  candidates.sort(compareCandidates);
+  return candidates.slice(0, topK).map((candidate, index) => ({
+    ...candidate,
+    label: `${candidate.label}#${index + 1}`
+  }));
+}
+
+function compareCandidates(left: Candidate, right: Candidate): number {
+  const scoreComparison = compareScore(left.score, right.score);
+  if (scoreComparison !== 0) {
+    return scoreComparison;
+  }
+  return candidateStableKey(left).localeCompare(candidateStableKey(right));
+}
+
+function compareScore(left: number[], right: number[]): number {
+  const length = Math.max(left.length, right.length);
+  return compareScorePrefix(left, right, length);
+}
+
+function compareScorePrefix(left: number[], right: number[], length: number): number {
+  for (let index = 0; index < length; index += 1) {
+    const leftScore = left[index] ?? 0;
+    const rightScore = right[index] ?? 0;
+    if (leftScore > rightScore) {
+      return -1;
+    }
+    if (leftScore < rightScore) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+function candidateStableKey(candidate: StampPlacement): string {
+  return `${candidate.kind}:${candidate.rotation}:${candidate.anchor.x.toString().padStart(2, "0")}:${candidate.anchor.y.toString().padStart(2, "0")}`;
+}
+
+function layoutSearchKey(hub: StampPlacement, pod1: StampPlacement, pod2: StampPlacement, labs: StampPlacement | null): string {
+  return [hub, pod1, pod2, ...(labs ? [labs] : [])].map(candidateStableKey).join("|");
+}
+
+function layoutKey(plan: RoomStampPlan): string {
+  const stamps = [plan.stamps.hub, ...plan.stamps.fastfillers, ...(plan.stamps.labs ? [plan.stamps.labs] : [])];
+  return stamps.map(candidateStableKey).join("|");
+}
+
+function placementStateKey(state: PlacementState): string {
+  return state.placements.map(candidateStableKey).join("|");
+}
+
+function normalizeTopK(topK: number): number {
+  if (!Number.isInteger(topK) || topK <= 0) {
+    throw new Error(`topK must be a positive integer, received ${topK}.`);
+  }
+  return topK;
+}
+
+function estimateProvisionalDefenseCutSize(features: RoomFeatures, center: Coord): number {
+  const protectedTiles = createProvisionalDefenseProtectedTileMask(features, center);
+  if (!protectedTiles.hasProtectedTile) {
+    return 0;
+  }
+
+  return solveProvisionalDefenseCut(features, protectedTiles.mask);
+}
+
+function createProvisionalDefenseProtectedTileMask(features: RoomFeatures, center: Coord): {
+  mask: Uint8Array;
+  hasProtectedTile: boolean;
+} {
+  const left = Math.max(1, center.x - 5);
+  const right = Math.min(roomSize - 2, center.x + 4);
+  const top = Math.max(1, center.y - 5);
+  const bottom = Math.min(roomSize - 2, center.y + 4);
+  const protectedTiles = new Uint8Array(roomArea);
+  let hasProtectedTile = false;
+
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      const tile = toIndex(x, y);
+      if (!isProvisionalCutWalkableTile(features, tile)) {
+        continue;
+      }
+      protectedTiles[tile] = 1;
+      hasProtectedTile = true;
+    }
+  }
+
+  return { mask: protectedTiles, hasProtectedTile };
+}
+
+function solveProvisionalDefenseCut(features: RoomFeatures, protectedTiles: Uint8Array): number {
+  const source = 0;
+  const sink = 1;
+  const tileInNodes = new Int32Array(roomArea);
+  const tileOutNodes = new Int32Array(roomArea);
+  const edges: WeightedMinCutEdge[] = [];
+  let nodeCount = 2;
+
+  tileInNodes.fill(-1);
+  tileOutNodes.fill(-1);
+
+  for (let tile = 0; tile < roomArea; tile += 1) {
+    if (!isProvisionalCutWalkableTile(features, tile)) {
+      continue;
+    }
+    tileInNodes[tile] = nodeCount;
+    nodeCount += 1;
+    tileOutNodes[tile] = nodeCount;
+    nodeCount += 1;
+  }
+
+  for (let tile = 0; tile < roomArea; tile += 1) {
+    if (tileInNodes[tile] < 0) {
+      continue;
+    }
+
+    const tileCutCapacity = protectedTiles[tile] !== 0 ? provisionalCutImpossibleCapacity : 1;
+    edges.push({ from: tileInNodes[tile]!, to: tileOutNodes[tile]!, capacity: tileCutCapacity });
+
+    const coord = fromIndex(tile);
+    for (const neighbor of neighbors(coord)) {
+      const neighborTile = toIndex(neighbor.x, neighbor.y);
+      if (tileInNodes[neighborTile] < 0) {
+        continue;
+      }
+      edges.push({
+        from: tileOutNodes[tile]!,
+        to: tileInNodes[neighborTile]!,
+        capacity: provisionalCutImpossibleCapacity
+      });
+    }
+  }
+
+  for (const exit of features.exits) {
+    const exitTile = toIndex(exit.x, exit.y);
+    if (tileInNodes[exitTile] >= 0) {
+      edges.push({ from: source, to: tileInNodes[exitTile]!, capacity: provisionalCutImpossibleCapacity });
+    }
+  }
+
+  for (let tile = 0; tile < roomArea; tile += 1) {
+    if (protectedTiles[tile] !== 0 && tileOutNodes[tile] >= 0) {
+      edges.push({ from: tileOutNodes[tile]!, to: sink, capacity: provisionalCutImpossibleCapacity });
+    }
+  }
+
+  const result = solveWeightedMinCut({
+    nodeCount,
+    source,
+    sink,
+    edges
+  });
+  return result.maxFlow >= provisionalCutImpossibleCapacity / 2 ? roomArea : result.maxFlow;
+}
+
+function isProvisionalCutWalkableTile(features: RoomFeatures, tile: number): boolean {
+  if (!isValidIndex(tile) || features.basePathBlocked[tile] !== 0) {
+    return false;
+  }
+  const coord = fromIndex(tile);
+  return isWalkableTerrain(features.terrain, coord.x, coord.y);
+}
+
+function createUpgradingMask(features: RoomFeatures): Uint8Array {
+  const mask = new Uint8Array(roomArea);
+  for (let y = 1; y < roomSize - 1; y += 1) {
+    for (let x = 1; x < roomSize - 1; x += 1) {
+      if (range({ x, y }, features.controller) <= 3 && isWalkableTerrain(features.terrain, x, y)) {
+        mask[toIndex(x, y)] = 1;
+      }
+    }
+  }
+  return mask;
+}
+
+function countConnectedTiles(mask: Uint8Array, seeds: Coord[]): number {
+  const visited = new Uint8Array(roomArea);
+  const stack = new Uint16Array(roomArea);
+  let stackSize = 0;
+  let count = 0;
+
+  for (const seed of seeds) {
+    const index = toIndex(seed.x, seed.y);
+    if (mask[index] === 0 || visited[index] !== 0) {
+      continue;
+    }
+    visited[index] = 1;
+    stack[stackSize] = index;
+    stackSize += 1;
+  }
+
+  while (stackSize > 0) {
+    stackSize -= 1;
+    const index = stack[stackSize]!;
+    count += 1;
+    const { x, y } = fromIndex(index);
+
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        if (dx === 0 && dy === 0) {
+          continue;
+        }
+        const nextX = x + dx;
+        const nextY = y + dy;
+        if (!isInRoom(nextX, nextY)) {
+          continue;
+        }
+        const nextIndex = toIndex(nextX, nextY);
+        if (mask[nextIndex] === 0 || visited[nextIndex] !== 0) {
+          continue;
+        }
+        visited[nextIndex] = 1;
+        stack[stackSize] = nextIndex;
+        stackSize += 1;
+      }
+    }
+  }
+
+  return count;
+}
+
+function hasOpenNeighborAfterPlacement(features: RoomFeatures, state: PlacementState, placement: StampPlacement, coord: Coord): boolean {
+  const blocked = new Uint8Array(state.pathBlocked);
+  for (const tile of getStampPathBlockedTiles(placement)) {
+    if (tile >= 0) {
+      blocked[tile] = 1;
+    }
+  }
+  blocked[toIndex(coord.x, coord.y)] = 0;
+
+  for (const neighbor of neighbors(coord)) {
+    if (isWalkableTerrain(features.terrain, neighbor.x, neighbor.y) && blocked[toIndex(neighbor.x, neighbor.y)] === 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasHubSpawnStorageAccess(
+  features: RoomFeatures,
+  state: PlacementState,
+  hub: StampPlacement,
+  storageDistanceMap: DijkstraMap | null
+): boolean {
+  if (storageDistanceMap === null) {
+    return false;
+  }
+
+  const spawn = getHubSpawnAnchor(hub);
+  for (const neighbor of neighbors(spawn)) {
+    const tile = toIndex(neighbor.x, neighbor.y);
+    if (
+      isWalkableTerrain(features.terrain, neighbor.x, neighbor.y)
+      && state.pathBlocked[tile] === 0
+      && features.reservedPathMasks.default[tile] === 0
+      && storageDistanceMap.get(neighbor.x, neighbor.y) !== dijkstraUnreachable
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasFiniteAccessDistance(features: RoomFeatures, state: PlacementState, map: DijkstraMap, target: Coord): boolean {
+  return minDistance(map, getPathGoals(features, state, target, features.reservedPathMasks.default)) !== dijkstraUnreachable;
+}
+
+function getPathGoals(features: RoomFeatures, state: PlacementState, target: Coord, reservedPathMask: Uint8Array | null): Coord[] {
+  return neighbors(target).filter((coord) => (
+    isWalkableTerrain(features.terrain, coord.x, coord.y)
+    && state.pathBlocked[toIndex(coord.x, coord.y)] === 0
+    && (reservedPathMask === null || reservedPathMask[toIndex(coord.x, coord.y)] === 0)
+  ));
+}
+
+function getDirectPathGoals(features: RoomFeatures, state: PlacementState, target: Coord, reservedPathMask: Uint8Array): Coord[] {
+  if (
+    isWalkableTerrain(features.terrain, target.x, target.y)
+    && state.pathBlocked[toIndex(target.x, target.y)] === 0
+    && reservedPathMask[toIndex(target.x, target.y)] === 0
+  ) {
+    return [target];
+  }
+  return getPathGoals(features, state, target, reservedPathMask);
+}
+
+function minDistance(map: DijkstraMap, goals: Coord[]): number {
+  let best = dijkstraUnreachable;
+  for (const goal of goals) {
+    const distance = map.get(goal.x, goal.y);
+    if (distance < best) {
+      best = distance;
+    }
+  }
+  return best;
+}
+
+function isAdjacentToControllerRangeTile(features: RoomFeatures, target: Coord, controllerRange: number): boolean {
+  return neighbors(target).some((coord) => (
+    isWalkableTerrain(features.terrain, coord.x, coord.y)
+    && range(coord, features.controller) <= controllerRange
+  ));
+}
+
+function findExitTiles(terrain: string): Coord[] {
+  const exits: Coord[] = [];
+  for (let x = 0; x < roomSize; x += 1) {
+    if (isWalkableTerrain(terrain, x, 0)) {
+      exits.push({ x, y: 0 });
+    }
+    if (isWalkableTerrain(terrain, x, roomSize - 1)) {
+      exits.push({ x, y: roomSize - 1 });
+    }
+  }
+  for (let y = 1; y < roomSize - 1; y += 1) {
+    if (isWalkableTerrain(terrain, 0, y)) {
+      exits.push({ x: 0, y });
+    }
+    if (isWalkableTerrain(terrain, roomSize - 1, y)) {
+      exits.push({ x: roomSize - 1, y });
+    }
+  }
+  return exits;
+}
+
+function isNaturalBlocker(object: RoomPlanningObject): boolean {
+  return object.type === "controller" || object.type === "source" || object.type === "mineral" || object.type === "deposit";
+}
+
+function isReservedStampTileForRoom(room: RoomPlanningRoomData, x: number, y: number): boolean {
+  if (!isInRoom(x, y)) {
+    return false;
+  }
+
+  const coord = { x, y };
+  return room.objects.some((object) => (
+    (object.type === "controller" && range(coord, object) <= controllerStampReserveRange)
+    || (object.type === "source" && range(coord, object) <= sourceStampReserveRange)
+  ));
+}
+
+function isReservedStampTile(
+  controller: RoomPlanningObject,
+  sources: [RoomPlanningObject, RoomPlanningObject],
+  x: number,
+  y: number
+): boolean {
+  const coord = { x, y };
+  return range(coord, controller) <= controllerStampReserveRange
+    || sources.some((source) => range(coord, source) <= sourceStampReserveRange);
+}
+
+function createReservedPathMasks(controller: RoomPlanningObject, sources: [RoomPlanningObject, RoomPlanningObject]): ReservedPathMasks {
+  return {
+    default: createReservedPathMask(controller, sources, null),
+    edgeOrigin: createReservedPathMask(controller, sources, { kind: "edge" }),
+    sourceOrigins: [
+      createReservedPathMask(controller, sources, { kind: "source", index: 0 }),
+      createReservedPathMask(controller, sources, { kind: "source", index: 1 })
+    ]
+  };
+}
+
+function createReservedPathMask(
+  controller: RoomPlanningObject,
+  sources: [RoomPlanningObject, RoomPlanningObject],
+  exemption: ReservedPathExemption
+): Uint8Array {
+  const mask = new Uint8Array(roomArea);
+
+  for (let y = 0; y < roomSize; y += 1) {
+    for (let x = 0; x < roomSize; x += 1) {
+      if (isReservedPathTile(controller, sources, x, y, exemption)) {
+        mask[toIndex(x, y)] = 1;
+      }
+    }
+  }
+
+  return mask;
+}
+
+function isReservedPathTile(
+  controller: RoomPlanningObject,
+  sources: [RoomPlanningObject, RoomPlanningObject],
+  x: number,
+  y: number,
+  exemption: ReservedPathExemption
+): boolean {
+  const coord = { x, y };
+  if (exemption?.kind === "source" && range(coord, sources[exemption.index]!) <= sourceStampReserveRange) {
+    return false;
+  }
+  if (exemption?.kind === "edge" && !isConstructionSiteCoordinate(x, y)) {
+    return false;
+  }
+
+  if (!isConstructionSiteCoordinate(x, y)) {
+    return true;
+  }
+
+  if (range(coord, controller) <= controllerStampReserveRange) {
+    return true;
+  }
+
+  return sources.some((source, index) => (
+    range(coord, source) <= sourceStampReserveRange
+    && !(exemption?.kind === "source" && exemption.index === index)
+  ));
+}
+
+function neighbors(coord: Coord): Coord[] {
+  const result: Coord[] = [];
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) {
+        continue;
+      }
+      const x = coord.x + dx;
+      const y = coord.y + dy;
+      if (isInRoom(x, y)) {
+        result.push({ x, y });
+      }
+    }
+  }
+  return result;
+}
+
+function compareObjects(left: RoomPlanningObject, right: RoomPlanningObject): number {
+  if (left.x !== right.x) {
+    return left.x - right.x;
+  }
+  if (left.y !== right.y) {
+    return left.y - right.y;
+  }
+  return left.id.localeCompare(right.id);
+}
+
+function range(left: Coord, right: Coord): number {
+  return Math.max(Math.abs(left.x - right.x), Math.abs(left.y - right.y));
+}
+
+function isInRoom(x: number, y: number): boolean {
+  return Number.isInteger(x) && Number.isInteger(y) && x >= 0 && x < roomSize && y >= 0 && y < roomSize;
+}
+
+function isValidIndex(index: number): boolean {
+  return Number.isInteger(index) && index >= 0 && index < roomArea;
+}
+
+function toIndex(x: number, y: number): number {
+  return y * roomSize + x;
+}
+
+function fromIndex(index: number): Coord {
+  return {
+    x: index % roomSize,
+    y: Math.floor(index / roomSize)
+  };
+}
+
+function validateTerrain(terrain: string): void {
+  if (terrain.length !== roomArea) {
+    throw new Error(`Expected terrain string length ${roomArea}, received ${terrain.length}.`);
+  }
+}
+
+function createDebugPhase(name: string, candidates: Candidate[], selected: StampPlacement | null): StampSearchDebugPhase {
+  return {
+    name,
+    selectedLabel: selected?.label ?? null,
+    candidates: candidates.map((candidate, index) => ({
+      key: candidateStableKey(candidate),
+      kind: candidate.kind,
+      label: candidate.label,
+      rank: index + 1,
+      rotation: candidate.rotation,
+      anchor: candidate.anchor,
+      anchors: candidate.anchors,
+      blockedTiles: candidate.blockedTiles,
+      score: candidate.score,
+      rejected: false
+    }))
+  };
+}
+
+function createTreeNode(
+  id: string,
+  candidate: Candidate,
+  index: number,
+  selected: boolean,
+  children: StampSearchTreeNode[],
+  completeScore?: number[]
+): StampSearchTreeNode {
+  return {
+    id,
+    candidate: {
+      key: candidateStableKey(candidate),
+      kind: candidate.kind,
+      label: candidate.label,
+      rank: index + 1,
+      rotation: candidate.rotation,
+      anchor: candidate.anchor,
+      anchors: candidate.anchors,
+      blockedTiles: candidate.blockedTiles,
+      score: candidate.score,
+      rejected: false
+    },
+    selected,
+    completeScore,
+    children
+  };
+}
+
+class GridCostMatrix implements Pick<PathFinder["CostMatrix"], "get"> {
+  private readonly blocked: Uint8Array;
+  private readonly reserved: Uint8Array | null;
+
+  constructor(blocked: Uint8Array, reserved: Uint8Array | null = null) {
+    this.blocked = blocked;
+    this.reserved = reserved;
+  }
+
+  get(x: number, y: number): number {
+    const index = toIndex(x, y);
+    return this.blocked[index] === 0 && (this.reserved === null || this.reserved[index] === 0) ? 0 : 255;
+  }
+}
+
+function rectangleOffsets(width: number, height: number, origin: Coord = { x: 0, y: 0 }): Coord[] {
+  const offsets: Coord[] = [];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      offsets.push({ x: x + origin.x, y: y + origin.y });
+    }
+  }
+  return offsets;
+}
+
+function fastfillerOffsets(): Coord[] {
+  const offsets = new Map<string, Coord>();
+  for (const coord of [
+    ...rectangleOffsets(3, 3, { x: -2, y: 0 }),
+    ...rectangleOffsets(3, 3, { x: 0, y: -2 })
+  ]) {
+    offsets.set(`${coord.x},${coord.y}`, coord);
+  }
+  return [...offsets.values()];
+}
+
+function labRoadOffsets(): Coord[] {
+  return [
+    { x: 0, y: 0 },
+    { x: 1, y: 1 },
+    { x: 2, y: 2 },
+    { x: 3, y: 3 }
+  ];
+}
+
+function labRoadPathBlockedOffsets(): Coord[] {
+  return [
+    { x: 1, y: 1 },
+    { x: 2, y: 2 },
+    { x: 3, y: 3 }
+  ];
+}
+
+function labStructureOffsets(): Coord[] {
+  return [
+    { x: 1, y: 0 },
+    { x: 2, y: 0 },
+    { x: 0, y: 1 },
+    { x: 2, y: 1 },
+    { x: 3, y: 1 },
+    { x: 0, y: 2 },
+    { x: 1, y: 2 },
+    { x: 3, y: 2 },
+    { x: 1, y: 3 },
+    { x: 2, y: 3 }
+  ];
+}
+
+function labBlockedOffsets(): Coord[] {
+  return [...labRoadOffsets(), ...labStructureOffsets()];
+}
+
+type StampConstructionOffset = {
+  type: ConstructionSiteStructureType;
+  offset: Coord;
+};
+
+type StampConstructionTile = {
+  type: ConstructionSiteStructureType;
+  tile: number;
+};
+
+function getStampConstructionTiles(stamp: StampPlacement): StampConstructionTile[] {
+  return getStampConstructionOffsets(stamp).map((spec) => {
+    const offset = rotateOffset(spec.offset, stamp.rotation);
+    return {
+      type: spec.type,
+      tile: toIndex(stamp.anchor.x + offset.x, stamp.anchor.y + offset.y)
+    };
+  });
+}
+
+function getStampConstructionOffsets(stamp: StampPlacement): StampConstructionOffset[] {
+  switch (stamp.kind) {
+    case "hub":
+      return stamp.label === "hub-temple" ? templeHubConstructionOffsets() : normalHubConstructionOffsets();
+    case "fastfiller":
+      return fastfillerConstructionOffsets();
+    case "labs":
+      return [
+        ...labRoadOffsets().map((offset) => ({ type: "road" as const, offset })),
+        ...labStructureOffsets().map((offset) => ({ type: "lab" as const, offset }))
+      ];
+  }
+}
+
+function normalHubConstructionOffsets(): StampConstructionOffset[] {
+  return [
+    { type: "storage", offset: { x: 0, y: 0 } },
+    { type: "link", offset: { x: 1, y: 0 } },
+    { type: "terminal", offset: { x: 2, y: 0 } },
+    { type: "factory", offset: { x: 0, y: 1 } },
+    { type: "powerSpawn", offset: { x: 0, y: 2 } },
+    { type: "spawn", offset: { x: 1, y: 2 } }
+  ];
+}
+
+function templeHubConstructionOffsets(): StampConstructionOffset[] {
+  return [
+    ...normalHubConstructionOffsets(),
+    { type: "lab", offset: { x: 2, y: 2 } },
+    { type: "lab", offset: { x: 3, y: 2 } },
+    { type: "lab", offset: { x: 3, y: 1 } }
+  ];
+}
+
+function fastfillerConstructionOffsets(): StampConstructionOffset[] {
+  const fillerOffsets = new Set(["-1,1", "1,-1"]);
+  const containerOffset = { x: 0, y: 0 };
+  const spawnOffset = { x: -1, y: 0 };
+  const linkOffset = { x: 1, y: 0 };
+  const offsets: StampConstructionOffset[] = [
+    { type: "container", offset: containerOffset },
+    { type: "spawn", offset: spawnOffset },
+    { type: "link", offset: linkOffset }
+  ];
+
+  for (const offset of fastfillerOffsets()) {
+    const key = `${offset.x},${offset.y}`;
+    if (
+      key === `${containerOffset.x},${containerOffset.y}`
+      || key === `${spawnOffset.x},${spawnOffset.y}`
+      || key === `${linkOffset.x},${linkOffset.y}`
+      || fillerOffsets.has(key)
+    ) {
+      continue;
+    }
+    offsets.push({ type: "extension", offset });
+  }
+
+  return offsets;
+}
+
+const normalHubTemplate: StampTemplate = {
+  kind: "hub",
+  label: "hub-normal",
+  rotations: [0, 90, 180, 270],
+  blockedOffsets: rectangleOffsets(3, 3),
+  anchors: {
+    storage: { x: 0, y: 0 },
+    terminal: { x: 2, y: 0 },
+    hubCenter: { x: 1, y: 1 }
+  }
+};
+
+const templeHubTemplate: StampTemplate = {
+  kind: "hub",
+  label: "hub-temple",
+  rotations: [0, 90, 180, 270],
+  blockedOffsets: rectangleOffsets(4, 3),
+  anchors: {
+    storage: { x: 0, y: 0 },
+    terminal: { x: 2, y: 0 },
+    hubCenter: { x: 1, y: 1 }
+  }
+};
+
+const fastfillerTemplate: StampTemplate = {
+  kind: "fastfiller",
+  label: "fastfiller",
+  rotations: [0, 90],
+  blockedOffsets: fastfillerOffsets(),
+  anchors: {
+    container: { x: 0, y: 0 }
+  }
+};
+
+const labTemplate: StampTemplate = {
+  kind: "labs",
+  label: "labs",
+  rotations: [0, 90, 180, 270],
+  blockedOffsets: labBlockedOffsets(),
+  pathBlockedOffsets: [...labStructureOffsets(), ...labRoadPathBlockedOffsets()],
+  roadOffsets: labRoadOffsets(),
+  anchors: {
+    entrance: { x: 0, y: 0 }
+  }
+};
+
+export function getStampPathBlockedTiles(stamp: StampPlacement): number[] {
+  return stamp.pathBlockedTiles ?? stamp.blockedTiles;
+}
+
+function getAddedPathBlockedTiles(stamp: StampPlacement): number[] {
+  const pathBlockedTiles = getStampPathBlockedTiles(stamp);
+  if (stamp.kind !== "fastfiller") {
+    return pathBlockedTiles;
+  }
+
+  const anchorTile = toIndex(stamp.anchor.x, stamp.anchor.y);
+  return pathBlockedTiles.filter((tile) => tile !== anchorTile);
+}

@@ -30,6 +30,8 @@ export type VariantBuildRecord = {
   nodeVersion: string;
 };
 
+export type ScreepsModule = string | { binary: string };
+
 export type VariantRecord = {
   role: VariantRole;
   snapshot: VariantSnapshot;
@@ -258,10 +260,7 @@ export type NexusTelemetrySnapshot = {
     dropToPickupLatencyAvg: number;
     gridNodeUtilization: number;
   };
-  blueprints: Array<{
-    name: string;
-    timesSpawned: number;
-  }>;
+  blueprints: Array<{ name: string; timesSpawned: number }>;
   architect: {
     structuresPlaced: number;
     roadCoverage: number;
@@ -270,12 +269,30 @@ export type NexusTelemetrySnapshot = {
   };
 };
 
+export type RunSampleRoomImage = {
+  room: string;
+  path: string;
+  width: number;
+  height: number;
+  scale: number;
+  objects: number;
+};
+
 export type RunSample = {
   gameTime: number;
   users: RoleRecord<UserSampleMetrics>;
   rooms?: RoleRecord<RunSampleRoomMetrics>;
+  roomImages?: RoleRecord<RunSampleRoomImage>;
   reports?: RoleRecord<BotReport | null>;
   nexusTelemetry?: RoleRecord<NexusTelemetrySnapshot | null>;
+};
+
+export type CpuRunSummaryMetrics = {
+  observedTickCount: number;
+  avgUsedPerTick: number | null;
+  peakUsedPerTick: number | null;
+  topLevelAvgPerTick: Record<string, number>;
+  topLevelPeakPerTick: Record<string, number>;
 };
 
 export type UserRunSummaryMetrics = {
@@ -287,13 +304,7 @@ export type UserRunSummaryMetrics = {
   maxOwnedControllers: number;
   firstExtensionTick: number | null;
   allRcl2ExtensionsTick: number | null;
-  nexusTelemetrySampleCount: number;
-  nexusSpawnEfficiencyPct: number | null;
-  nexusSourceCoveragePct: number | null;
-  nexusCortexSkipRatePct: number | null;
-  nexusLogisticsEfficiencyPct: number | null;
-  nexusProtocolChurnRatePct: number | null;
-  nexusRoadCoverage: number | null;
+  cpu?: CpuRunSummaryMetrics;
 };
 
 export type RunSummaryMetrics = {

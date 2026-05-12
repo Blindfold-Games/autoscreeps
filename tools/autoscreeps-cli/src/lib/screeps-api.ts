@@ -1,4 +1,4 @@
-import type { AuthSession, RoomSummary, UserBadge, UserWorldStatus } from "./contracts.ts";
+import type { AuthSession, RoomSummary, ScreepsModule, UserBadge, UserWorldStatus } from "./contracts.ts";
 
 type ScreepsApiClientOptions = {
   requestTimeoutMs?: number;
@@ -7,7 +7,7 @@ type ScreepsApiClientOptions = {
 type RegisterPayload = {
   username: string;
   password: string;
-  modules: Record<string, string>;
+  modules: Record<string, ScreepsModule>;
 };
 
 export type RoomObjectRecord = {
@@ -31,6 +31,16 @@ export type RoomObjectRecord = {
 export type RoomObjectsResponse = {
   objects: RoomObjectRecord[];
   users: Record<string, { username: string }>;
+};
+
+type RoomTerrainRecord = {
+  room?: string;
+  terrain?: string;
+  type?: string;
+};
+
+type RoomTerrainResponse = {
+  terrain?: string | RoomTerrainRecord | RoomTerrainRecord[];
 };
 
 export type StatsUserRecord = {
@@ -90,9 +100,14 @@ export class ScreepsApiClient {
         username: payload.username,
         email: "",
         password: payload.password,
-        modules: payload.modules
+        modules: { main: "" }
       })
     });
+
+    if (hasNonEmptyModules(payload.modules)) {
+      const session = await this.signIn(payload.username, payload.password);
+      await this.setUserCode(session, payload.modules);
+    }
   }
 
   async signIn(username: string, password: string): Promise<AuthSession> {
@@ -132,6 +147,16 @@ export class ScreepsApiClient {
     });
   }
 
+  async setUserCode(session: AuthSession, modules: Record<string, ScreepsModule>, branch = "$activeWorld"): Promise<void> {
+    await this.requestAuthedJson(session, "/api/user/code", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        modules
+      })
+    });
+  }
+
   async getWorldStatus(session: AuthSession): Promise<UserWorldStatus> {
     return await this.requestAuthedJson<UserWorldStatus>(session, "/api/user/world-status");
   }
@@ -156,6 +181,17 @@ export class ScreepsApiClient {
 
   async getRoomObjects(room: string): Promise<RoomObjectsResponse> {
     return await this.requestJson<RoomObjectsResponse>(`/api/game/room-objects?room=${encodeURIComponent(room)}`);
+  }
+
+  async getRoomTerrain(room: string): Promise<string> {
+    const response = await this.requestJson<RoomTerrainResponse>(
+      `/api/game/room-terrain?room=${encodeURIComponent(room)}&encoded=1`
+    );
+    const terrain = extractEncodedTerrain(response, room);
+    if (!terrain) {
+      throw new Error(`Room terrain response did not include encoded terrain for '${room}'.`);
+    }
+    return terrain;
   }
 
   async getStats(): Promise<StatsResponse> {
@@ -287,4 +323,29 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function hasNonEmptyModules(modules: Record<string, ScreepsModule>): boolean {
+  return Object.values(modules).some((moduleSource) => {
+    if (typeof moduleSource === "string") {
+      return moduleSource.length > 0;
+    }
+    return moduleSource.binary.length > 0;
+  });
+}
+
+function extractEncodedTerrain(response: RoomTerrainResponse, room: string): string | null {
+  if (typeof response.terrain === "string") {
+    return response.terrain;
+  }
+
+  if (!response.terrain) {
+    return null;
+  }
+
+  const records = Array.isArray(response.terrain) ? response.terrain : [response.terrain];
+  const record = records.find((item) => item.room === room && typeof item.terrain === "string")
+    ?? records.find((item) => typeof item.terrain === "string");
+
+  return typeof record?.terrain === "string" ? record.terrain : null;
 }

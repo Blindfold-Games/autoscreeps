@@ -1,4 +1,4 @@
-import type { RoleRecord, RunSample, RunSampleRoomMetrics, RunSummaryMetrics, UserRunSummaryMetrics, UserSampleMetrics, VariantRole } from "./contracts.ts";
+import type { BotReport, CpuRunSummaryMetrics, RoleRecord, RunSample, RunSampleRoomMetrics, RunSummaryMetrics, UserRunSummaryMetrics, UserSampleMetrics, VariantRole } from "./contracts.ts";
 
 const trackedControllerLevels = [1, 2, 3, 4, 5, 6, 7, 8] as const;
 const rcl1ProgressTotal = 200;
@@ -49,6 +49,7 @@ function collectRoles(samples: RunSample[]): VariantRole[] {
 
 function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSummaryMetrics {
   const controllerLevelMilestones = initializeControllerLevelMilestones();
+  const cpuAccumulator = createCpuSummaryAccumulator();
   let firstSeenGameTime: number | null = null;
   let controllerProgressToRCL3Pct: number | null = null;
   let maxCombinedRCL = 0;
@@ -56,22 +57,6 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
   let firstExtensionTick: number | null = null;
   let allRcl2ExtensionsTick: number | null = null;
   let sampleCount = 0;
-  let nexusTelemetrySampleCount = 0;
-  let nexusSpawnEventSamples = 0;
-  let nexusTotalSpawnEvents = 0;
-  let nexusTotalIdleSpawnTicks = 0;
-  let nexusSourceCoverageSamples = 0;
-  let nexusTotalSourceCoverage = 0;
-  let nexusCortexSkipSamples = 0;
-  let nexusTotalScheduled = 0;
-  let nexusTotalSkipped = 0;
-  let nexusLogisticsSamples = 0;
-  let nexusTotalEnergyRouted = 0;
-  let nexusTotalDropsCreated = 0;
-  let nexusChurnSamples = 0;
-  let nexusTotalChurnRate = 0;
-  let nexusRoadCoverageSamples = 0;
-  let nexusTotalRoadCoverage = 0;
 
   for (const sample of samples) {
     const stats = sample.users[role];
@@ -107,53 +92,7 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
       }
     }
 
-    const nexusTelemetry = sample.nexusTelemetry?.[role];
-    if (nexusTelemetry) {
-      nexusTelemetrySampleCount++;
-
-      const spawnEvents = nexusTelemetry.spawn.spawnEvents;
-      const idleSpawnTicks = nexusTelemetry.spawn.idleSpawnTicks;
-      if (spawnEvents + idleSpawnTicks > 0) {
-        nexusSpawnEventSamples++;
-        nexusTotalSpawnEvents += spawnEvents;
-        nexusTotalIdleSpawnTicks += idleSpawnTicks;
-      }
-
-      const mineProtocols = nexusTelemetry.protocols.filter((p) =>
-        p.type.toLowerCase().includes("mine") || p.type.toLowerCase().includes("extract")
-      );
-      if (mineProtocols.length > 0) {
-        nexusSourceCoverageSamples++;
-        nexusTotalSourceCoverage += mineProtocols.filter((p) => p.creepCount > 0).length / Math.max(mineProtocols.length, 1);
-      }
-
-      const scheduled = nexusTelemetry.cortex.protocolsScheduled;
-      const skipped = nexusTelemetry.cortex.protocolsSkipped;
-      if (scheduled + skipped > 0) {
-        nexusCortexSkipSamples++;
-        nexusTotalScheduled += scheduled;
-        nexusTotalSkipped += skipped;
-      }
-
-      const dropsCreated = nexusTelemetry.logistics.dropsCreated;
-      if (dropsCreated > 0) {
-        nexusLogisticsSamples++;
-        nexusTotalEnergyRouted += nexusTelemetry.logistics.totalEnergyRouted;
-        nexusTotalDropsCreated += dropsCreated;
-      }
-
-      const activeProtocols = nexusTelemetry.protocols.length;
-      if (activeProtocols > 0) {
-        const churnCount = nexusTelemetry.protocols.filter((p) => p.created || p.destroyed).length;
-        nexusChurnSamples++;
-        nexusTotalChurnRate += churnCount / activeProtocols;
-      }
-
-      if (nexusTelemetry.architect.roadCoverage > 0) {
-        nexusRoadCoverageSamples++;
-        nexusTotalRoadCoverage += nexusTelemetry.architect.roadCoverage;
-      }
-    }
+    recordCpuSummary(cpuAccumulator, sample.reports?.[role] ?? null);
   }
 
   return {
@@ -165,25 +104,101 @@ function summarizeVariant(samples: RunSample[], role: VariantRole): UserRunSumma
     maxOwnedControllers,
     firstExtensionTick,
     allRcl2ExtensionsTick,
-    nexusTelemetrySampleCount,
-    nexusSpawnEfficiencyPct: nexusSpawnEventSamples > 0
-      ? toPercent(nexusTotalSpawnEvents, nexusTotalSpawnEvents + nexusTotalIdleSpawnTicks)
-      : null,
-    nexusSourceCoveragePct: nexusSourceCoverageSamples > 0
-      ? toPercent(nexusTotalSourceCoverage, nexusSourceCoverageSamples)
-      : null,
-    nexusCortexSkipRatePct: nexusCortexSkipSamples > 0
-      ? toPercent(nexusTotalSkipped, nexusTotalScheduled + nexusTotalSkipped)
-      : null,
-    nexusLogisticsEfficiencyPct: nexusLogisticsSamples > 0
-      ? toPercent(nexusTotalEnergyRouted, nexusTotalDropsCreated * 300)
-      : null,
-    nexusProtocolChurnRatePct: nexusChurnSamples > 0
-      ? toPercent(nexusTotalChurnRate, nexusChurnSamples)
-      : null,
-    nexusRoadCoverage: nexusRoadCoverageSamples > 0
-      ? Math.round((nexusTotalRoadCoverage / nexusRoadCoverageSamples) * 10000) / 100
-      : null
+    ...(cpuAccumulator.observedTickCount > 0 ? { cpu: finalizeCpuSummary(cpuAccumulator) } : {})
+  };
+}
+
+function createCpuSummaryAccumulator(): {
+  observedTickCount: number;
+  totalUsed: number;
+  peakUsed: number | null;
+  topLevelTotals: Record<string, number>;
+  topLevelPeaks: Record<string, number>;
+} {
+  return {
+    observedTickCount: 0,
+    totalUsed: 0,
+    peakUsed: null,
+    topLevelTotals: {},
+    topLevelPeaks: {}
+  };
+}
+
+function recordCpuSummary(
+  accumulator: ReturnType<typeof createCpuSummaryAccumulator>,
+  report: BotReport | null
+): void {
+  const cpu = extractCpuSummary(report);
+  if (cpu === null) {
+    return;
+  }
+
+  accumulator.observedTickCount += 1;
+  accumulator.totalUsed += cpu.used;
+  accumulator.peakUsed = accumulator.peakUsed === null ? cpu.used : Math.max(accumulator.peakUsed, cpu.used);
+
+  for (const phase of cpu.topLevelPhases) {
+    accumulator.topLevelTotals[phase.label] = (accumulator.topLevelTotals[phase.label] ?? 0) + phase.total;
+    accumulator.topLevelPeaks[phase.label] = Math.max(accumulator.topLevelPeaks[phase.label] ?? 0, phase.total);
+  }
+}
+
+function finalizeCpuSummary(
+  accumulator: ReturnType<typeof createCpuSummaryAccumulator>
+): CpuRunSummaryMetrics {
+  return {
+    observedTickCount: accumulator.observedTickCount,
+    avgUsedPerTick: divideAndRound(accumulator.totalUsed, accumulator.observedTickCount),
+    peakUsedPerTick: roundMetric(accumulator.peakUsed),
+    topLevelAvgPerTick: Object.fromEntries(
+      Object.entries(accumulator.topLevelTotals)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([label, total]) => [label, divideAndRound(total, accumulator.observedTickCount) ?? 0])
+    ),
+    topLevelPeakPerTick: Object.fromEntries(
+      Object.entries(accumulator.topLevelPeaks)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([label, peak]) => [label, roundMetric(peak) ?? 0])
+    )
+  };
+}
+
+function extractCpuSummary(report: BotReport | null): {
+  used: number;
+  topLevelPhases: Array<{ label: string; total: number }>;
+} | null {
+  if (!report || !isRecord(report.telemetry)) {
+    return null;
+  }
+
+  const cpu = report.telemetry.cpu;
+  if (!isRecord(cpu)) {
+    return null;
+  }
+
+  const used = normalizeNumber(cpu.used);
+  if (used === null) {
+    return null;
+  }
+
+  const rawProfile = Array.isArray(cpu.profile) ? cpu.profile : [];
+  const topLevelPhases = rawProfile.flatMap((entry) => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+
+    const label = typeof entry.label === "string" ? entry.label : null;
+    const total = normalizeNumber(entry.total);
+    if (label === null || total === null) {
+      return [];
+    }
+
+    return [{ label, total }];
+  });
+
+  return {
+    used,
+    topLevelPhases
   };
 }
 
@@ -224,7 +239,26 @@ function normalizeControllerProgressToRcl3Pct(progress: number): number {
   return Math.round((boundedProgress / totalProgressToRcl3) * 10000) / 100;
 }
 
-function toPercent(numerator: number, denominator: number): number | null {
-  if (denominator <= 0) return null;
-  return Math.round((numerator / denominator) * 10000) / 100;
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null;
+}
+
+function normalizeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function divideAndRound(total: number, count: number): number | null {
+  if (count <= 0) {
+    return null;
+  }
+
+  return roundMetric(total / count);
+}
+
+function roundMetric(value: number | null): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  return Math.round(value * 1000) / 1000;
 }

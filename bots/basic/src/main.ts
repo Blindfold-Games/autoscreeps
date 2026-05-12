@@ -1,33 +1,23 @@
-import { cleanupDeadCreeps } from "./memory";
-import { runWorker } from "./roles/worker";
-import { runSpawnManager } from "./spawn";
-import { recordBotError } from "./telemetry-state";
-import { recordTelemetry } from "./telemetry";
-
-export function runTick(): StructureSpawn | null {
-  cleanupDeadCreeps();
-
-  const primarySpawn = Object.values(Game.spawns)[0] ?? null;
-  if (primarySpawn) {
-    runSpawnManager(primarySpawn);
-  }
-
-  for (const creep of Object.values(Game.creeps)) {
-    runWorker(creep);
-  }
-
-  return primarySpawn;
-}
+import { runTick } from "./core/run-tick";
+import type { TickResult, WorldSnapshot } from "./core/types";
+import { recordBotError } from "./state/telemetry";
+import { createCpuProfiler, measureCpu } from "./telemetry/cpu-profiler";
+import { recordTelemetry } from "./telemetry/report";
+import { observeWorld } from "./world/observe";
 
 export const loop = (): void => {
-  let primarySpawn: StructureSpawn | null = null;
+  let result: TickResult | null = null;
+  let world: WorldSnapshot | null = null;
+  const profiler = createCpuProfiler();
 
   try {
-    primarySpawn = runTick();
+    result = runTick(profiler);
+    world = result.world;
   } catch (error) {
     const message = error instanceof Error ? error.stack ?? error.message : String(error);
     recordBotError(message);
   }
 
-  recordTelemetry(primarySpawn);
+  world ??= measureCpu(profiler, "observeFallback", () => observeWorld());
+  recordTelemetry(world, result?.plan, result?.execution, profiler);
 };

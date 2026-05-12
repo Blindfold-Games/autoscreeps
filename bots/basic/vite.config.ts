@@ -1,9 +1,8 @@
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { defineConfig, type PluginOption } from "vite";
 import { loadDeploymentTarget, resolveBundlePath, uploadBundle } from "./scripts/screeps-upload";
 
-const rootDir = fileURLToPath(new URL(".", import.meta.url));
+const rootDir = import.meta.dirname;
 
 function screepsUploadPlugin(target: Awaited<ReturnType<typeof loadDeploymentTarget>>): PluginOption {
   return {
@@ -27,9 +26,9 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: "dist",
       emptyOutDir: true,
-      minify: false,
+      minify: true,
       sourcemap: true,
-      target: "es2018",
+      target: "node24",
       lib: {
         entry: path.resolve(rootDir, "src/main.ts"),
         formats: ["cjs"],

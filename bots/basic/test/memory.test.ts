@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { cleanupDeadCreeps } from "../src/memory";
+import { createEnergyLedgerState } from "../src/state/telemetry";
+import { cleanupDeadCreeps } from "../src/state/reconcile-creeps";
 import { installScreepsGlobals } from "./helpers/install-globals";
 
 describe("cleanupDeadCreeps", () => {
@@ -18,18 +19,20 @@ describe("cleanupDeadCreeps", () => {
     testGlobal.Memory = {
       creeps: {
         alive: {
-          role: "worker",
+          role: "runner",
           working: false,
           homeRoom: "W0N0"
         },
         missing: {
-          role: "worker",
+          role: "harvester",
           working: true,
-          homeRoom: "W0N0"
+          homeRoom: "W0N0",
+          lastEnergy: 23
         }
       },
       telemetry: {
         creepDeaths: 0,
+        energy: createEnergyLedgerState(),
         firstOwnedSpawnTick: null,
         rcl2Tick: null,
         rcl3Tick: null
@@ -43,5 +46,6 @@ describe("cleanupDeadCreeps", () => {
     expect(Memory.creeps.alive).toBeDefined();
     expect(Memory.creeps.missing).toBeUndefined();
     expect(Memory.telemetry?.creepDeaths).toBe(1);
+    expect(Memory.telemetry?.energy?.lostOnCreepDeath).toBe(23);
   });
 });
