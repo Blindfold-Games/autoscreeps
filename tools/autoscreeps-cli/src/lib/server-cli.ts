@@ -22,7 +22,7 @@ const cliProbeScript = [
   "socket.setEncoding('utf8');",
   "let greeted = false;",
   "let buffer = '';",
-  "const timeout = setTimeout(function () { console.error('Timed out waiting for Screeps CLI response'); process.exit(1); }, 10000);",
+  "const timeout = setTimeout(function () { console.error('Timed out waiting for Screeps CLI response'); process.exit(1); }, 100000);",
   "socket.on('data', function (chunk) {",
   "  if (!greeted) {",
   "    greeted = true;",
@@ -65,7 +65,7 @@ export class ScreepsServerCli {
     this.options = options;
   }
 
-  async waitForReady(timeoutMs = 120000): Promise<void> {
+  async waitForReady(timeoutMs = 300000): Promise<void> {
     const start = Date.now();
 
     while (Date.now() - start < timeoutMs) {
@@ -272,35 +272,57 @@ export class ScreepsServerCli {
     const normalizedExpression = expression.replace(/\r?\n\s*/g, " ").trim();
     const command = `Promise.resolve().then(() => (${normalizedExpression})).then((value) => JSON.stringify({ ok: true, value })).catch((error) => JSON.stringify({ ok: false, error: String(error && (error.stack || error)) }))`;
 
-    const { stdout } = await execa(
-      "docker",
-      [
-        "compose",
-        "exec",
-        "-T",
-        "-e",
-        `AUTO_CLI_HOST=${this.options.host}`,
-        "-e",
-        `AUTO_CLI_PORT=${this.options.port}`,
-        "-e",
-        `AUTO_CLI_COMMAND=${command}`,
-        "screeps",
-        "node",
-        "-e",
-        cliProbeScript
-      ],
-      {
-        cwd: this.options.repoRoot,
-        stdio: "pipe"
-      }
-    );
+    const maxAttempts = 8;
+    let lastError: unknown;
 
-    const envelope = JSON.parse(stdout) as CliEnvelope<T>;
-    if (!envelope.ok) {
-      throw new Error(envelope.error ?? `CLI evaluation failed for ${expression}`);
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const { stdout } = await execa(
+          "docker",
+          [
+            "compose",
+            "exec",
+            "-T",
+            "-e",
+            `AUTO_CLI_HOST=${this.options.host}`,
+            "-e",
+            `AUTO_CLI_PORT=${this.options.port}`,
+            "-e",
+            `AUTO_CLI_COMMAND=${command}`,
+            "screeps",
+            "node",
+            "-e",
+            cliProbeScript
+          ],
+          {
+            cwd: this.options.repoRoot,
+            stdio: "pipe"
+          }
+        );
+
+        const envelope = JSON.parse(stdout) as CliEnvelope<T>;
+        if (!envelope.ok) {
+          throw new Error(envelope.error ?? `CLI evaluation failed for ${expression}`);
+        }
+
+        return envelope.value as T;
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+        const retryable =
+          message.includes("ECONNREFUSED") ||
+          message.includes("Timed out waiting for Screeps CLI response") ||
+          message.includes("Screeps CLI closed before sending the greeting");
+
+        if (!retryable || attempt === maxAttempts) {
+          throw error;
+        }
+
+        await delay(500 * attempt);
+      }
     }
 
-    return envelope.value as T;
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 }
 

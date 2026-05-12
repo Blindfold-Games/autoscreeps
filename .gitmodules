@@ -1,0 +1,3 @@
+[submodule "bots/nexus"]
+	path = bots/nexus
+	url = git@github.com:Blindfold-Games/screeps-nexus.git

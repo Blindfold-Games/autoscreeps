@@ -64,7 +64,7 @@ export class ScreepsApiClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? null;
   }
 
-  async waitForReady(timeoutMs = 120000): Promise<void> {
+  async waitForReady(timeoutMs = 300000): Promise<void> {
     const start = Date.now();
 
     while (Date.now() - start < timeoutMs) {
