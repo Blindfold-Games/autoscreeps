@@ -259,6 +259,8 @@ export type NexusTelemetrySnapshot = {
     dropsCreated: number;
     dropToPickupLatencyAvg: number;
     gridNodeUtilization: number;
+    fabricatorSourceFetches: number;
+    haulerIdleCount: number;
   };
   blueprints: Array<{ name: string; timesSpawned: number }>;
   architect: {

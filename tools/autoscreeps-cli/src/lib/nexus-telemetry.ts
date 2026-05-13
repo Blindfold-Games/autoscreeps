@@ -71,7 +71,9 @@ export function parseNexusTelemetry(value: string | null): NexusTelemetrySnapsho
       totalEnergyRouted: typeof logistics.totalEnergyRouted === "number" ? logistics.totalEnergyRouted as number : 0,
       dropsCreated: typeof logistics.dropsCreated === "number" ? logistics.dropsCreated as number : 0,
       dropToPickupLatencyAvg: typeof logistics.dropToPickupLatencyAvg === "number" ? logistics.dropToPickupLatencyAvg as number : 0,
-      gridNodeUtilization: typeof logistics.gridNodeUtilization === "number" ? logistics.gridNodeUtilization as number : 0
+      gridNodeUtilization: typeof logistics.gridNodeUtilization === "number" ? logistics.gridNodeUtilization as number : 0,
+      fabricatorSourceFetches: typeof logistics.fabricatorSourceFetches === "number" ? logistics.fabricatorSourceFetches as number : 0,
+      haulerIdleCount: typeof logistics.haulerIdleCount === "number" ? logistics.haulerIdleCount as number : 0
     },
     blueprints: Array.isArray(parsed.blueprints)
       ? parsed.blueprints.flatMap((b) => {
