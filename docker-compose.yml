@@ -12,6 +12,7 @@ services:
     volumes:
       - ./config.yml:/screeps/config.yml:ro
       - ./dynamicMarketConfig.js:/screeps/dynamicMarketConfig.js:ro
+      - ./strongholds.patch.js:/screeps/node_modules/@screeps/backend/lib/strongholds.js:ro
       - screeps-user:/home/node
       - screeps-data:/data
       - screeps-mods:/screeps/mods
@@ -19,7 +20,63 @@ services:
       MONGO_HOST: mongo
       REDIS_HOST: redis
       STEAM_KEY: ${STEAM_KEY:?Missing STEAM_KEY in .env}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:21025', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
     restart: unless-stopped
+
+  init:
+    image: node:24-alpine
+    depends_on:
+      screeps:
+        condition: service_healthy
+    environment:
+      SCREEPS_URL: http://screeps:21025
+      SCREEPS_USERNAME: autoscreeps
+      SCREEPS_PASSWORD: autoscreeps
+    command:
+      - node
+      - -e
+      - |
+        const http = require('http');
+        const net = require('net');
+        const u = process.env.SCREEPS_USERNAME, p = process.env.SCREEPS_PASSWORD;
+        function post(path, body) {
+          return new Promise((resolve, reject) => {
+            const data = JSON.stringify(body);
+            const req = http.request(process.env.SCREEPS_URL + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } }, res => {
+              let buf = '';
+              res.on('data', c => buf += c);
+              res.on('end', () => resolve(JSON.parse(buf)));
+            });
+            req.on('error', reject);
+            req.end(data);
+          });
+        }
+        function cliSetPassword(username, password) {
+          return new Promise((resolve, reject) => {
+            const socket = net.createConnection({ host: 'screeps', port: 21026 });
+            socket.setEncoding('utf8');
+            let greeted = false;
+            const timeout = setTimeout(() => { socket.destroy(); reject(new Error('CLI timeout')); }, 30000);
+            socket.on('data', () => {
+              if (!greeted) { greeted = true; socket.write('setPassword(' + JSON.stringify(username) + ', ' + JSON.stringify(password) + ')\n', 'utf8'); return; }
+              clearTimeout(timeout); socket.end(); resolve();
+            });
+            socket.on('error', err => { clearTimeout(timeout); reject(err); });
+          });
+        }
+        post('/api/register/submit', { username: u, email: '', password: p, modules: { main: '' } })
+          .then(r => {
+            if (r.ok) { console.log('Created user', u); return; }
+            if (r.error && r.error.toLowerCase().includes('exists')) { console.log('User exists, resetting password via CLI'); return cliSetPassword(u, p).then(() => console.log('Password reset for', u)); }
+            throw new Error('register failed: ' + JSON.stringify(r));
+          })
+          .catch(e => { console.error(e.message); process.exit(1); });
+    restart: "no"
 
   client:
     image: node:24-alpine
