@@ -17,6 +17,8 @@ These repositories are cloned under `references/` for local source inspection.
 ## Operations
 
 - use conventional commits
+- use the fff MCP tools for all file search operations instead of default tools.
+
 
 ## Experimental Thinking
 
