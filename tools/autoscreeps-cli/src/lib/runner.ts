@@ -5,6 +5,7 @@ import type {
   AuthSession,
   BotReportHealth,
   EventRecord,
+  NexusTelemetrySnapshot,
   RoleRecord,
   RunDetails,
   RunFailureKind,
@@ -25,7 +26,8 @@ import type {
   VariantRole,
   ScreepsModule
 } from "./contracts.ts";
-import { autoscreepsReportSegmentId, inspectReportsByRole, type BotReportInspection } from "./bot-telemetry.ts";
+import { autoscreepsReportSegmentId, nexusTelemetrySegmentId, inspectReportsByRole, type BotReportInspection } from "./bot-telemetry.ts";
+import { parseNexusTelemetry } from "./nexus-telemetry.ts";
 import { resetPrivateServer, restartScreepsService, startScreepsService, stopScreepsService } from "./docker.ts";
 import { createWorkspaceSnapshot, parseVariantSource, resolveRepoRoot, withGitWorktree } from "./git.ts";
 import { appendEvent, appendIndexEntry, appendRunSample, createRunWorkspace, writeMetrics, writeRunRecord, writeVariantRecords } from "./history.ts";
@@ -343,13 +345,13 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
     await api.registerUser({
       username: credentials.baseline!.username,
       password: credentials.baseline!.password,
-      modules: preparedBaseline.modules
+      modules: { main: "" }
     });
     if (preparedCandidate && credentials.candidate) {
       await api.registerUser({
         username: credentials.candidate.username,
         password: credentials.candidate.password,
-        modules: preparedCandidate.modules
+        modules: { main: "" }
       });
     }
 
@@ -361,6 +363,8 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
     for (const role of roles) {
       const session = await api.signIn(credentials[role]!.username, credentials[role]!.password);
       sessions[role] = session;
+      const modules = role === "baseline" ? preparedBaseline.modules : preparedCandidate!.modules;
+      await api.uploadCode(session, modules);
       await api.placeAutoSpawn(session, runRecord.rooms[role]!);
     }
     await logEvent(runDir, "info", "rooms.claimed", "Placed auto spawns for the assigned rooms.", runRecord.rooms);
@@ -429,10 +433,14 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
 
         lastProcessedGameTime = gameTime;
 
-        const reportEntries = await Promise.all(
-          roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, autoscreepsReportSegmentId)] as const)
-        );
+        const [reportEntries, nexusTelemetryEntries] = await Promise.all([
+          Promise.all(roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, autoscreepsReportSegmentId)] as const)),
+          Promise.all(roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, nexusTelemetrySegmentId)] as const))
+        ]);
         const reportsByRole = inspectReportsByRole(Object.fromEntries(reportEntries) as RoleRecord<string | null>);
+        const nexusTelemetryByRole = Object.fromEntries(
+          nexusTelemetryEntries.map(([role, value]) => [role, parseNexusTelemetry(value)])
+        ) as RoleRecord<NexusTelemetrySnapshot | null>;
         await ensureReportsHealthy(runDir, gameTime, reportsByRole, roles);
 
         if (pendingRoomMutations.length > 0) {
@@ -491,7 +499,7 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
         }
 
         if (captureSample && stats) {
-          const sample = buildRunSample(gameTime, stats, credentials, runRecord.rooms, reportsByRole, roomObjectsByRole, roles);
+          const sample = buildRunSample(gameTime, stats, credentials, runRecord.rooms, reportsByRole, nexusTelemetryByRole, roomObjectsByRole, roles);
           if (roomObjectsByRole) {
             await attachRoomImages(sample, gameTime, roomObjectsByRole);
           }
@@ -553,14 +561,16 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
     )) as RunMetrics["rooms"];
 
     if (samples[samples.length - 1]?.gameTime !== endGameTime) {
-      const reportEntries = await Promise.all(
-        roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, autoscreepsReportSegmentId)] as const)
-      );
+      const [reportEntries, nexusTelemetryEntries, roomEntries] = await Promise.all([
+        Promise.all(roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, autoscreepsReportSegmentId)] as const)),
+        Promise.all(roles.map(async (role) => [role, await api.getMemorySegment(sessions[role]!, nexusTelemetrySegmentId)] as const)),
+        Promise.all(roles.map(async (role) => [role, await api.getRoomObjects(runRecord.rooms[role]!)] as const))
+      ]);
       const reportsByRole = inspectReportsByRole(Object.fromEntries(reportEntries) as RoleRecord<string | null>);
+      const nexusTelemetryByRole = Object.fromEntries(
+        nexusTelemetryEntries.map(([role, value]) => [role, parseNexusTelemetry(value)])
+      ) as RoleRecord<NexusTelemetrySnapshot | null>;
       await ensureReportsHealthy(runDir, endGameTime, reportsByRole, roles);
-      const roomEntries = await Promise.all(
-        roles.map(async (role) => [role, await api.getRoomObjects(runRecord.rooms[role]!)] as const)
-      );
       const finalRoomObjectsByRole = Object.fromEntries(roomEntries) as RoleRecord<RoomObjectsResponse>;
       const finalSample = buildRunSample(
         endGameTime,
@@ -568,6 +578,7 @@ async function runExperiment(input: ExperimentRunInput): Promise<RunDetails> {
         credentials,
         runRecord.rooms,
         reportsByRole,
+        nexusTelemetryByRole,
         finalRoomObjectsByRole,
         roles
       );
@@ -932,6 +943,7 @@ function buildRunSample(
   credentials: RoleRecord<{ username: string }>,
   rooms: RoleRecord<string>,
   reportData: ReportInspectionsByRole,
+  nexusTelemetryByRole: RoleRecord<NexusTelemetrySnapshot | null>,
   roomObjectsByRole: RoleRecord<RoomObjectsResponse> | null,
   roles: VariantRole[]
 ): RunSample {
@@ -959,6 +971,10 @@ function buildRunSample(
   sample.reports = Object.fromEntries(
     roles.map((role) => [role, reportData[role]?.snapshot ?? null])
   ) as RunSample["reports"];
+
+  sample.nexusTelemetry = Object.fromEntries(
+    roles.map((role) => [role, nexusTelemetryByRole[role] ?? null])
+  ) as RunSample["nexusTelemetry"];
 
   return sample;
 }
